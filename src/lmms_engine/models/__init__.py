@@ -10,6 +10,7 @@ from .llava_onevision1_5 import (
     apply_liger_kernel_to_llava_onevision1_5,
 )
 from .monkey_patch import MONKEY_PATCHER
+from .nanovlm import NanovlmConfig, NanovlmForConditionalGeneration
 from .qwen2 import apply_liger_kernel_to_qwen2
 from .qwen2_5_omni import (
     Qwen2_5OmniThinkerConfig,
@@ -67,6 +68,8 @@ __all__ = [
     "LLaDADLLMConfig",
     "LLaDADLLMForMaskedLM",
     "MONKEY_PATCHER",
+    "NanovlmConfig",
+    "NanovlmForConditionalGeneration",
     "RaeSiglipConfig",
     "RaeSiglipModel",
     "SiTModel",
