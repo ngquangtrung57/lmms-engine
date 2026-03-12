@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from ...models.aero.processing_aero import AeroProcessor, AeroProcessorKwargs
 from .config import ProcessorConfig
@@ -18,6 +19,14 @@ class AeroDataProcessor:
     def build(self):
         self.processor = self._build_processor()
         self.processor.chat_template = self.chat_template_no_system
+
+    @property
+    def special_tokens(self):
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = DataUtilities.get_special_tokens(
+                self.processor.tokenizer, extra_tokens=["<|im_start|>", "<|im_end|>"]
+            )
+        return self._special_tokens
 
     def _build_processor(self):
         processor = AeroProcessor.from_pretrained(self.config.processor_name)
@@ -88,9 +97,7 @@ class AeroDataProcessor:
         system_message: str = "You are a helpful assistant",
         add_system_prompt: bool = True,
     ):
-        special_tokens = self.processor.tokenizer.additional_special_tokens
-        special_tokens.extend(["<|im_start|>", "<|im_end|>"])
-        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in special_tokens]
+        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
         input_id, target = [], []
         # The purpose of start from is to record which mm token we are at. Supposing the format is interleaved
         # Then we need to record this so that the mm token can be expanded correctly per conversation
@@ -100,12 +107,13 @@ class AeroDataProcessor:
         video_start_from = 0
 
         if add_system_prompt and hf_messages[0]["role"] != "system":
-            input_id += self.processor.tokenizer.apply_chat_template([{"role": "system", "content": system_message}])
+            input_id += DataUtilities.apply_chat_template(
+                self.processor, [{"role": "system", "content": [{"type": "text", "text": system_message}]}]
+            )
             target += [-100] * len(input_id)
         for message in hf_messages:
             role = message["role"]
-            # Cautions, qwen2_5 vl tokenizer wrap into a list
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)[0]
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
             if self.audio_token_id in encode_id:
                 encode_id, used_audio = self._expand_encode_id_audio_tokens(
                     encode_id, num_audio_tokens, audio_start_from

@@ -8,6 +8,7 @@ from transformers.models.llava_onevision.processing_llava_onevision import (
 )
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from .config import ProcessorConfig
 from .llava_processor import LLaVADataProcessor
@@ -114,8 +115,7 @@ class LLaVAVideoDataProcessor(LLaVADataProcessor):
         """
         image_token_index = self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
         video_token_index = self.processor.tokenizer.convert_tokens_to_ids(self.processor.video_token)
-        special_tokens = self.processor.tokenizer.additional_special_tokens
-        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in special_tokens]
+        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
 
         input_id, target = [], []
         image_idx = 0
@@ -123,7 +123,7 @@ class LLaVAVideoDataProcessor(LLaVADataProcessor):
 
         for message in hf_messages:
             role = message["role"]
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)[0]
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
 
             # Expand image tokens
             if image_token_index in encode_id and num_image_tokens and image_idx < len(num_image_tokens):

@@ -35,6 +35,8 @@ from lmms_engine.parallel.sequence_parallel.ulysses import (
     ulysses_pad,
 )
 
+from ..common_ops.rope import qwen2_5_vl_rope_index
+from ..common_ops.visual import parse_visual_output
 from ..sequence_packing_utils import BaseModelOutputWithPastAndRmpad, _unpad_input
 
 logger = logging.get_logger(__name__)
@@ -107,7 +109,8 @@ def vl_model_forward(
     if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
         # calculate RoPE index once per generation in the pre-fill stage only
         if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-            position_ids, rope_deltas = self.get_rope_index(
+            position_ids, rope_deltas = qwen2_5_vl_rope_index(
+                self,
                 original_input_ids,  # Here we use the padded input ids
                 image_grid_thw,
                 video_grid_thw,
@@ -143,7 +146,7 @@ def vl_model_forward(
 
     if pixel_values is not None:
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = parse_visual_output(self.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -161,7 +164,7 @@ def vl_model_forward(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds = parse_visual_output(self.visual(pixel_values_videos, grid_thw=video_grid_thw))
         n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
@@ -476,12 +479,17 @@ def attn_forward(
     # Unsqueeze the first dim to apply pos embeds
     query_states = query_states.unsqueeze(0).transpose(1, 2)
     key_states = key_states.unsqueeze(0).transpose(1, 2)
+    # transformers 5.0 compatible fixing
+    if hasattr(self, "rope_scaling"):
+        mrope_section = self.rope_scaling["mrope_section"]
+    elif hasattr(self, "rope_parameters"):
+        mrope_section = self.rope_parameters["mrope_section"]
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states,
         key_states,
         cos,
         sin,
-        self.rope_scaling["mrope_section"],
+        mrope_section,
     )
 
     max_seqlen = torch.diff(cu_seq_lens).max().item() if cu_seq_lens is not None else None

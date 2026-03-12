@@ -8,6 +8,7 @@ from transformers.models.llava_onevision.processing_llava_onevision import (
 )
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from .config import ProcessorConfig
 
@@ -19,6 +20,12 @@ class LLaVADataProcessor:
 
     def build(self):
         self.processor = self._build_processor()
+
+    @property
+    def special_tokens(self):
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = DataUtilities.get_special_tokens(self.processor.tokenizer)
+        return self._special_tokens
 
     def _build_processor(self):
         processor = LlavaOnevisionProcessor.from_pretrained(self.config.processor_name)
@@ -64,13 +71,12 @@ class LLaVADataProcessor:
 
     def get_qwen_template_labels(self, hf_messages, num_image_tokens: List[int]):
         image_token_index = self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
-        special_tokens = self.processor.tokenizer.additional_special_tokens
-        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in special_tokens]
+        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
         input_id, target = [], []
         start_from = 0
         for message in hf_messages:
             role = message["role"]
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)[0]
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
             # If num image tokens is not None, it means we have images in the batch
             # otherwise something like <image> tag in html is used
             if image_token_index in encode_id and num_image_tokens is not None:

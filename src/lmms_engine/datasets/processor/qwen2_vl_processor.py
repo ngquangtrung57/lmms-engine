@@ -6,6 +6,7 @@ from transformers import Qwen2VLProcessor
 from transformers.models.qwen2_vl.processing_qwen2_vl import Qwen2VLProcessorKwargs
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from .config import ProcessorConfig
 
@@ -18,6 +19,12 @@ class Qwen2VLDataProcessor:
     def build(self):
         self.processor = self._build_processor()
         self.set_chat_template()
+
+    @property
+    def special_tokens(self):
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = DataUtilities.get_special_tokens(self.processor.tokenizer)
+        return self._special_tokens
 
     def _build_processor(self):
         processor = Qwen2VLProcessor.from_pretrained(self.config.processor_name)
@@ -78,17 +85,18 @@ class Qwen2VLDataProcessor:
         image_token_num: List[int],
         system_message: str = "You are a helpful assistant",
     ):
-        special_tokens = self.processor.tokenizer.additional_special_tokens
-        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in special_tokens]
+        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
         input_id, target = [], []
 
         # Image start from 0
         start_from = 0
-        input_id += self.processor.tokenizer.apply_chat_template([{"role": "system", "content": system_message}])
+        input_id += DataUtilities.apply_chat_template(
+            self.processor, [{"role": "system", "content": [{"type": "text", "text": system_message}]}]
+        )
         target += [-100] * len(input_id)
         for message in hf_messages:
             role = message["role"]
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
             if self.image_token_id in encode_id:
                 encode_id, used_images = self._expand_encode_id_image_tokens(encode_id, image_token_num, start_from)
                 start_from += used_images

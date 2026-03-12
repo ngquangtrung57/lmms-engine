@@ -31,11 +31,16 @@ from lmms_engine.parallel.sequence_parallel.ulysses import (
     ulysses_pad,
 )
 
+from ..common_ops.rope import qwen3_vl_get_rope_index
 from ..sequence_packing_utils import _unpad_input
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, rearrange
+
+from ..common_ops.visual import (
+    parse_visual_output_with_deepstack as parse_visual_output,
+)
 
 
 def _distribute_deepstack_embeds_for_rank(deepstack_embeds, original_mask, sp_size):
@@ -224,7 +229,8 @@ def model_forward(
             or (past_key_values is None or past_key_values.get_seq_length() == 0)
         )
         if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
-            position_ids, rope_deltas = self.get_rope_index(
+            position_ids, rope_deltas = qwen3_vl_get_rope_index(
+                self,
                 original_input_ids,
                 image_grid_thw,
                 video_grid_thw,
@@ -261,13 +267,15 @@ def model_forward(
 
     if pixel_values is not None:
         pixel_values = pixel_values.contiguous()
-        image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+        image_output = self.get_image_features(pixel_values, image_grid_thw)
+        image_embeds, deepstack_image_embeds = parse_visual_output(image_output)
         image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
     if pixel_values_videos is not None:
-        video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+        video_output = self.get_video_features(pixel_values_videos, video_grid_thw)
+        video_embeds, deepstack_video_embeds = parse_visual_output(video_output)
         video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
