@@ -10,7 +10,7 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Lint](https://github.com/EvolvingLMMs-Lab/lmms-engine/actions/workflows/lint.yml/badge.svg)](https://github.com/EvolvingLMMs-Lab/lmms-engine/actions/workflows/lint.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/EvolvingLMMs-Lab/lmms-engine?style=social)](https://github.com/LMMs-Lab/lmms-engine/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/EvolvingLMMs-Lab/lmms-engine?style=social)](https://github.com/EvolvingLMMs-Lab/lmms-engine/stargazers)
 
 [Quick Start](#-quick-start) • [Examples](#-featured-examples) • [Model Support](#-model-support) • [Optimizations](#️-optimizations) • [Codebase Architecture](#️-codebase-architecture) • [Documentation](#-documentation)
 
@@ -29,7 +29,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/LMMs-Lab/lmms-engine.git
+git clone https://github.com/EvolvingLMMs-Lab/lmms-engine.git
 cd lmms-engine
 
 # Install editable packages
@@ -415,7 +415,7 @@ If you use LMMs Engine in your research, please cite:
   title={LMMs Engine: A simple, unified multimodal framework for pretraining and finetuning.},
   author={LMMs-Lab},
   year={2025},
-  url={https://github.com/LMMs-Lab/lmms-engine}
+  url={https://github.com/EvolvingLMMs-Lab/lmms-engine}
 }
 ```
 
