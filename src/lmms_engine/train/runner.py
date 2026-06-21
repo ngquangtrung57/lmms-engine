@@ -47,6 +47,14 @@ class TrainRunner:
             # Never use packing for eval dataset
             self.eval_dataset_config.packing = False
             self.eval_dataset_config.dataset_path = config.dataset_config.eval_dataset_path
+            # Use a MAP-STYLE dataset for eval so a small held-out set is sharded evenly by
+            # DistributedSampler. The iterable type shards rank-mod -> uneven per-rank counts
+            # -> all_reduce/barrier deadlock during distributed eval. Default: strip the
+            # "_iterable" suffix off the train type (qwen3_vl_iterable -> qwen3_vl).
+            eval_type = config.dataset_config.eval_dataset_type
+            if eval_type is None:
+                eval_type = self.eval_dataset_config.dataset_type.replace("_iterable", "")
+            self.eval_dataset_config.dataset_type = eval_type
         self.model_config = config.model_config
         self.config = config
 
@@ -120,6 +128,9 @@ class TrainRunner:
             patch_type = getattr(self.model_config.monkey_patch_kwargs, "patch_type", [])
             kwargs["patch_type"].extend(patch_type)
             kwargs.update(self.model_config.monkey_patch_kwargs)
+        # Dedup: applying a patch fn twice double-wraps forwards that wrap the
+        # CURRENT class attr (e.g. vit_frame_parallel's wrap_vit_forward).
+        kwargs["patch_type"] = list(dict.fromkeys(kwargs["patch_type"]))
         try:
             MONKEY_PATCHER.apply_monkey_patch_to_instance(self.model, **kwargs)
         except Exception as e:

@@ -164,6 +164,13 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             iter_start = worker_id * per_worker
             iter_end = min(iter_start + per_worker, len(curr_data_list))
 
+        if iter_start >= iter_end:
+            # More workers than rows in this rank's shard (tiny datasets / many
+            # ranks): this worker has nothing to serve. HF .select() rejects
+            # start == len even for an empty range, so return an empty iterator
+            # instead of crashing the whole run.
+            return
+
         # Distrbute the data to each worker
         curr_data_list = curr_data_list.select(range(iter_start, iter_end))
         if getattr(self, "data_folder", None) is not None:
@@ -185,10 +192,23 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             )
 
             # Iterate through the dataset once per epoch
+            n_ok = 0
+            n_err = 0
             while self.cur_idx < len(curr_data_list):
                 try:
                     data_dict = self.get_one_sample(self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list)
+                    n_ok += 1
                 except Exception as e:
+                    n_err += 1
+                    # Fail fast when the WHOLE shard is broken (e.g. data folder
+                    # missing on this node): skip-and-continue would otherwise
+                    # rescan forever, spam multi-GB logs, and wedge the other
+                    # ranks in their collectives while this rank yields nothing.
+                    if n_err >= 100 and n_ok == 0:
+                        raise RuntimeError(
+                            f"first {n_err} samples of this shard ALL failed (last: {e}); "
+                            "data folder unreadable/missing on this node?"
+                        ) from e
                     traceback.print_exc()
                     logger.error(f"Error getting one sample: {e}, skip this sample")
                     self.cur_idx += 1

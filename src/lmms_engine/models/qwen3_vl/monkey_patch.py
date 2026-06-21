@@ -21,12 +21,20 @@ try:
         _patch_swiglu_module,
     )
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
-    from liger_kernel.transformers.rope import (
-        liger_rotary_pos_emb,
-        liger_rotary_pos_emb_vision,
-    )
+    from liger_kernel.transformers.rope import liger_rotary_pos_emb
     from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
-except:
+
+    # liger_rotary_pos_emb_vision is an optional ViT-rope speedup added in newer
+    # liger-kernel releases (absent in the pinned 0.6.2). Keep it optional so the
+    # ESSENTIAL rmpad patches and the text-side liger patches still apply when it
+    # is missing -- otherwise a NameError here makes the runner skip the entire
+    # monkey patch (including rmpad), breaking the sequence-packing path.
+    try:
+        from liger_kernel.transformers.rope import liger_rotary_pos_emb_vision
+    except ImportError:
+        liger_rotary_pos_emb_vision = None
+except Exception:
+    liger_rotary_pos_emb_vision = None
     print("liger kernel not installed, please install it with `pip install liger-kernel`")
 
 from lmms_engine.models.monkey_patch import MONKEY_PATCHER
@@ -82,12 +90,17 @@ def apply_liger_kernel_to_qwen3_vl(
 
     if rope:
         modeling_qwen3_vl.apply_rotary_pos_emb = liger_rotary_pos_emb
-        modeling_qwen3_vl.apply_rotary_pos_emb_vision = liger_rotary_pos_emb_vision
+        if liger_rotary_pos_emb_vision is not None:
+            modeling_qwen3_vl.apply_rotary_pos_emb_vision = liger_rotary_pos_emb_vision
     if rms_norm:
         modeling_qwen3_vl.Qwen3VLTextRMSNorm = LigerRMSNorm
     if cross_entropy:
         modeling_qwen3_vl.CrossEntropyLoss = LigerCrossEntropyLoss
     if fused_linear_cross_entropy:
+        # Stash generation-incompatible forwards before overwriting so
+        # MONKEY_PATCHER.generation_context() can restore the HF originals
+        # around model.generate() (in-loop benchmark eval).
+        MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLForConditionalGeneration, "forward")
         modeling_qwen3_vl.Qwen3VLForConditionalGeneration.forward = qwen3_vl_lce_forward
     if swiglu:
         modeling_qwen3_vl.Qwen3VLTextMLP = LigerSwiGLUMLP
@@ -100,6 +113,10 @@ def apply_liger_kernel_to_qwen3_vl(
         from .qwen3_vl_ops import model_forward as qwen3_ops_model_forward
         from .qwen3_vl_ops import text_model_forward as qwen3_ops_text_model_forward
 
+        MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLModel, "forward")
+        MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLTextModel, "forward")
+        MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLTextDecoderLayer, "forward")
+        MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLTextAttention, "forward")
         modeling_qwen3_vl.Qwen3VLModel.forward = qwen3_ops_model_forward
         modeling_qwen3_vl.Qwen3VLTextModel.forward = qwen3_ops_text_model_forward
         modeling_qwen3_vl.Qwen3VLTextDecoderLayer.forward = qwen3_ops_decoder_layer_forward
@@ -175,6 +192,9 @@ def apply_vit_frame_parallel_to_qwen3_vl(model: PreTrainedModel = None, **kwargs
         orig_forward=orig_forward,
         output_dispatch=output_dispatch,
     )
+    # Frame-parallel dispatch does dp_cp-group collectives -> deadlocks under
+    # per-rank independent generation; restore the original around generate().
+    MONKEY_PATCHER.stash_original(modeling_qwen3_vl.Qwen3VLVisionModel, "forward")
     modeling_qwen3_vl.Qwen3VLVisionModel.forward = wrapped
     logger.info(
         f"vit_frame_parallel: wrapped Qwen3VLVisionModel.forward "

@@ -18,6 +18,10 @@ class DatasetConfig(Args):
     shuffle: bool = True
     data_seed: Optional[int] = 42
     eval_dataset_path: Optional[str] = None
+    # Dataset type used for the eval set. Defaults to a map-style variant so a small
+    # held-out set is sharded evenly by DistributedSampler (the iterable type shards
+    # rank-mod -> uneven per-rank counts -> all_reduce/barrier deadlock during eval).
+    eval_dataset_type: Optional[str] = None
 
     # Object storage configuration
     object_storage: Optional[Literal["azure", "gcs", "none"]] = "none"

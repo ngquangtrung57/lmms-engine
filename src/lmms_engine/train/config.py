@@ -49,6 +49,10 @@ class TrainingArguments(transformers.TrainingArguments):
     # --- Eval Server Configuration ---
     eval_config: Optional[Dict[str, Any]] = None
 
+    # --- In-loop benchmark eval (generate + rule scoring on a verl-format parquet;
+    # keys -> lmms_engine.eval.benchmark.BenchmarkEvalConfig) ---
+    benchmark_eval: Optional[Dict[str, Any]] = None
+
     # --- Compute / CO2 Tracking ---
     carbon_intensity: Optional[float] = 0.475  # kgCO2/kWh, global average
 

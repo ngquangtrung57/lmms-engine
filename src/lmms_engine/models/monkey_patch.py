@@ -2,6 +2,7 @@
 # Modified to work on patch our models
 
 import collections
+import contextlib
 import inspect
 
 from loguru import logger
@@ -13,6 +14,42 @@ class MonkeyPatcher:
         # In format
         # {"model_type": {"liger": apply_liger_kernel_to_xxx, "custom": apply_custom_kernel_to_xxx}}
         self._dict = collections.defaultdict(dict)
+        # Original (pre-patch) class attributes keyed by (cls, attr_name).
+        # Patch functions call stash_original() right before overwriting a
+        # class-level method that is incompatible with generation (e.g. the
+        # rmpad forwards, which expect packed/unpadded inputs and crash in
+        # the kv-cache decode path). First write wins, so re-applying a
+        # patch never records an already-patched callable as "original".
+        self._stash = {}
+
+    def stash_original(self, cls, attr: str):
+        key = (cls, attr)
+        if key not in self._stash:
+            self._stash[key] = getattr(cls, attr)
+
+    @property
+    def has_stash(self) -> bool:
+        return bool(self._stash)
+
+    @contextlib.contextmanager
+    def generation_context(self):
+        """Temporarily restore the stashed original class methods so
+        ``model.generate()`` runs the plain HF padded/kv-cache path, then put
+        the patched (training) callables back on exit.
+
+        Restores the saved patched callables directly instead of re-invoking
+        the apply functions: re-applying would re-run instance-level patching
+        and double-wrap forwards (e.g. ``wrap_vit_forward``).
+        """
+        patched = {}
+        for (cls, attr), original in self._stash.items():
+            patched[(cls, attr)] = getattr(cls, attr)
+            setattr(cls, attr, original)
+        try:
+            yield
+        finally:
+            for (cls, attr), fn in patched.items():
+                setattr(cls, attr, fn)
 
     def register(self, model_type, patch_type):
         def decorator(func):

@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import random
 import shutil
@@ -13,7 +14,7 @@ import torch.nn as nn
 from accelerate.utils import send_to_device
 from loguru import logger
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.utils.data import Dataset, DistributedSampler, IterableDataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
@@ -22,6 +23,16 @@ from transformers.trainer_utils import seed_worker
 import lmms_engine.models.utils as model_utils
 import lmms_engine.parallel.process_group_manager as pgm
 from lmms_engine.eval.backends import EvalServerBackend
+from lmms_engine.eval.benchmark import (
+    BenchmarkDataset,
+    BenchmarkEvalConfig,
+    GenerationCollator,
+    aggregate_benchmark_results,
+    dedupe_by_idx,
+    load_reward_fn,
+    score_generation,
+)
+from lmms_engine.models.monkey_patch import MONKEY_PATCHER
 from lmms_engine.parallel.parallelize import MODEL_TO_PARALLEL_METHOD, apply_parallelize
 from lmms_engine.train.config import TrainingArguments
 from lmms_engine.train.registry import TRAINER_REGISTER
@@ -115,18 +126,28 @@ class FSDP2SFTTrainer:
             )
             assert self.args.eval_steps == self.args.save_steps, "eval_steps must be equal to save_steps"
 
+        # Optional in-loop benchmark eval (generation + rule scoring; ALL ranks
+        # participate -- generation forwards are FSDP collectives).
+        self.benchmark_config = None
+        if self.args.benchmark_eval is not None:
+            self.benchmark_config = BenchmarkEvalConfig.from_dict(self.args.benchmark_eval)
+        self.benchmark_dataloader = None
+        self.benchmark_reward_fn = None
+
     def prepare_dataloader(self, dataset: DatasetType, is_training: bool = True):
         data_collator = self.data_collator
+        # Eval uses per_device_eval_batch_size; keep persistent workers for training only.
+        batch_size = self.args.train_batch_size if is_training else self.args.eval_batch_size
         dataloader_params = {
-            "batch_size": self.args.train_batch_size,
+            "batch_size": batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
+            "persistent_workers": self.args.dataloader_persistent_workers and is_training,
         }
         if isinstance(dataset, IterableDataset):
             sampler = None
-        elif self.args.group_by_length:
+        elif is_training and self.args.group_by_length:
             sampler = DistributedLengthGroupedSampler(
                 self.args.train_batch_size * self.args.gradient_accumulation_steps,
                 dataset=dataset,
@@ -136,13 +157,18 @@ class FSDP2SFTTrainer:
                 rank=pgm.process_group_manager.dp_rank,
             )
         else:
+            # Eval: shuffle off (deterministic) and drop_last on the SAMPLER so every rank
+            # gets the SAME number of samples -> equal FSDP forward steps -> no collective
+            # deadlock (FSDP param all-gather is collective; ragged per-rank counts hang).
             sampler = DistributedSampler(
                 dataset,
                 num_replicas=pgm.process_group_manager.dp_world_size,
                 rank=pgm.process_group_manager.dp_rank,
+                shuffle=is_training,
+                drop_last=not is_training,
             )
         dataloader_params["sampler"] = sampler
-        dataloader_params["drop_last"] = self.args.dataloader_drop_last
+        dataloader_params["drop_last"] = self.args.dataloader_drop_last if is_training else True
         dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
         if is_training:
             dataloader_params["worker_init_fn"] = partial(
@@ -373,6 +399,17 @@ class FSDP2SFTTrainer:
 
         curr_epoch = start_epoch
 
+        # Step-0 evals on the initial weights (control points; fresh runs only).
+        # Val LOSS honors the HF-native trainer_args.eval_on_start; the benchmark
+        # has its own benchmark_eval.eval_on_start flag.
+        if self.eval_dataset is not None and getattr(self.args, "eval_on_start", False) and self.global_step == 0:
+            eval_metrics = self.evaluate()
+            if rank == 0 and eval_metrics:
+                eval_metrics["global_step"] = self.global_step
+                self.tracking.log(eval_metrics, step=self.global_step)
+        if self.benchmark_config is not None and self.benchmark_config.eval_on_start and self.global_step == 0:
+            self._run_benchmark_and_log(rank)
+
         pbar = tqdm(total=self.total_steps, desc="Training", disable=dist.get_rank() != 0)
         while not self.should_stop():
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
@@ -454,6 +491,16 @@ class FSDP2SFTTrainer:
                             total_limit=self.args.save_total_limit,
                         )
                         self.validation_step(output_dir, self.global_step)
+                        # Token-weighted held-out val loss (ALL ranks call; rank 0 logs).
+                        if self.eval_dataset is not None:
+                            eval_metrics = self.evaluate()
+                            if rank == 0 and eval_metrics:
+                                eval_metrics["global_step"] = self.global_step
+                                self.tracking.log(eval_metrics, step=self.global_step)
+
+                    # In-loop benchmark eval on its own cadence (independent of save_steps).
+                    if self._should_benchmark():
+                        self._run_benchmark_and_log(rank)
 
                     if (
                         self.args.torch_empty_cache_steps is not None
@@ -470,6 +517,14 @@ class FSDP2SFTTrainer:
         output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
         self.save_checkpoints(output_dir, self.global_step, total_limit=self.args.save_total_limit)
         self.validation_step(output_dir, self.global_step)
+        if self.eval_dataset is not None:
+            final_eval = self.evaluate()
+            if rank == 0 and final_eval:
+                final_eval["global_step"] = self.global_step
+                self.tracking.log(final_eval, step=self.global_step)
+        # Final benchmark eval, unless the in-loop gate already ran at this step.
+        if self.benchmark_config is not None and self.global_step % self.benchmark_config.eval_steps != 0:
+            self._run_benchmark_and_log(rank)
         # Wait for all pending eval jobs to complete
         if self.eval_backend is not None:
             self._check_eval_results(rank, wait_until_complete=True)
@@ -494,7 +549,156 @@ class FSDP2SFTTrainer:
         self.cuda_event_profiler.close()
 
     def evaluate(self):
-        raise NotImplementedError("Evaluation is not implemented")
+        """Token-weighted validation loss over the held-out eval_dataset.
+
+        ALL ranks must call this in lockstep: each FSDP forward triggers a collective
+        param all-gather, so we cannot eval on rank 0 only. The eval dataloader uses a
+        DistributedSampler with drop_last so every rank runs the same number of forward
+        steps. Loss is reduced as sum(per_token_loss) / sum(supervised_tokens) across all
+        ranks (token-weighted), matching the per-token-mean definition used in training.
+        """
+        if self.eval_dataset is None:
+            return {}
+        if getattr(self, "eval_dataloader", None) is None:
+            self.eval_dataloader = self.prepare_dataloader(self.eval_dataset, is_training=False)
+
+        was_training = self.fsdp2_model.training
+        self.fsdp2_model.eval()
+        device = self.fsdp2_model.device
+        sum_loss = torch.zeros((), device=device, dtype=torch.float32)
+        sum_tok = torch.zeros((), device=device, dtype=torch.float32)
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = send_to_device(batch, device, non_blocking=True)
+                loss = self.compute_loss(batch)  # mean CE over this batch's supervised tokens
+                n_tok = (batch["labels"] != -100).sum().to(torch.float32)
+                sum_loss += loss.float() * n_tok
+                sum_tok += n_tok
+        torch.distributed.all_reduce(sum_loss, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(sum_tok, op=torch.distributed.ReduceOp.SUM)
+        val_loss = (sum_loss / sum_tok.clamp(min=1.0)).item()
+        if was_training:
+            self.fsdp2_model.train()
+        return {"eval/loss": val_loss}
+
+    def _should_benchmark(self) -> bool:
+        return (
+            self.benchmark_config is not None
+            and self.global_step > 0
+            and self.global_step % self.benchmark_config.eval_steps == 0
+        )
+
+    def _prepare_benchmark(self):
+        cfg = self.benchmark_config
+        hf_processor = getattr(self.processing_class, "processor", self.processing_class)
+        dataset = BenchmarkDataset(cfg, hf_processor)
+        # drop_last=False pads by repeating samples -> every rank runs the same
+        # number of generate() calls (FSDP collectives stay lockstep); repeats
+        # are deduped by row idx during aggregation.
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=pgm.process_group_manager.dp_world_size,
+            rank=pgm.process_group_manager.dp_rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        self.benchmark_dataloader = DataLoader(
+            dataset,
+            batch_size=cfg.per_device_batch_size,
+            sampler=sampler,
+            collate_fn=GenerationCollator(hf_processor),
+            num_workers=cfg.num_workers,
+            drop_last=False,
+        )
+        self.benchmark_reward_fn = load_reward_fn(cfg.reward_fn_path, cfg.reward_fn_name)
+        self._benchmark_tokenizer = hf_processor.tokenizer
+
+    def benchmark_evaluate(self):
+        """Generation benchmark eval (verl ``_validate`` style).
+
+        Every rank generates its shard with the ORIGINAL HF forwards (the rmpad
+        training patches break the kv-cache decode path; ``generation_context``
+        restores them afterwards), scores generations with the rule reward fn,
+        then results are gathered to rank 0 for aggregation/logging.
+        """
+        cfg = self.benchmark_config
+        if cfg is None:
+            return {}
+        if pgm.process_group_manager.cp_world_size > 1 or pgm.process_group_manager.tp_world_size > 1:
+            logger.warning("benchmark_eval supports pure DP only (sp/tp degree 1); skipping")
+            return {}
+        if self.args.use_rmpad and not MONKEY_PATCHER.has_stash:
+            # Only patch fns that call stash_original (currently qwen3_vl) can be
+            # reverted for generation; rmpad forwards without a stash would crash
+            # in the kv-cache decode path or return garbage.
+            logger.warning(
+                "benchmark_eval: rmpad patches are active but no original forwards were stashed "
+                "(this model family's monkey patch lacks stash_original); skipping benchmark eval"
+            )
+            return {}
+        if self.benchmark_dataloader is None:
+            self._prepare_benchmark()
+
+        was_training = self.fsdp2_model.training
+        self.fsdp2_model.eval()
+        self.empty_cache()
+        device = self.fsdp2_model.device
+        tokenizer = self._benchmark_tokenizer
+        results = []
+        start_time = time.perf_counter()
+        with torch.no_grad(), MONKEY_PATCHER.generation_context():
+            for batch in self.benchmark_dataloader:
+                model_inputs = send_to_device(dict(batch["model_inputs"]), device)
+                input_len = model_inputs["input_ids"].shape[1]
+                max_new = max(cfg.max_total_len - input_len, 1)
+                if cfg.max_new_tokens is not None:
+                    max_new = min(max_new, cfg.max_new_tokens)
+                out = self.fsdp2_model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new,
+                    do_sample=cfg.do_sample,
+                    use_cache=True,
+                    # REQUIRED: HF does not auto-detect fully_shard (FSDP2); without
+                    # this, ranks finishing early stop forwarding and the remaining
+                    # ranks deadlock on the FSDP all-gather collectives.
+                    synced_gpus=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                # Left padding -> prompts end at a uniform offset.
+                generations = tokenizer.batch_decode(out[:, input_len:], skip_special_tokens=True)
+                for meta, generation in zip(batch["meta"], generations):
+                    results.append(score_generation(self.benchmark_reward_fn, meta, generation))
+
+        rank = dist.get_rank()
+        gathered = [None] * dist.get_world_size() if rank == 0 else None
+        dist.gather_object(results, gathered, dst=0)
+        if was_training:
+            self.fsdp2_model.train()
+        self.empty_cache()
+        if rank != 0:
+            return {}
+        flat = [r for rs in gathered for r in rs]
+        metrics = aggregate_benchmark_results(flat)
+        metrics["eval/bench/eval_time_s"] = round(time.perf_counter() - start_time, 1)
+        self._dump_benchmark_samples(flat)
+        return metrics
+
+    def _dump_benchmark_samples(self, results):
+        """Dump the first log_samples generations for inspection (rank 0 only)."""
+        dump_dir = os.path.join(self.args.output_dir, "bench_eval")
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"step{self.global_step}.jsonl")
+        rows = sorted(dedupe_by_idx(results), key=lambda r: r["idx"])[: self.benchmark_config.log_samples]
+        with open(path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info(f"Dumped {len(rows)} benchmark generations to {path}")
+
+    def _run_benchmark_and_log(self, rank: int):
+        bench_metrics = self.benchmark_evaluate()
+        if rank == 0 and bench_metrics:
+            bench_metrics["global_step"] = self.global_step
+            self.tracking.log(bench_metrics, step=self.global_step)
 
     def remove_old_checkpoints(self, output_path: str, total_limit: int = None):
         if total_limit is None:
