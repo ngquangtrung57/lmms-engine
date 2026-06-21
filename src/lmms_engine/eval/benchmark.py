@@ -116,7 +116,9 @@ class BenchmarkDataset(Dataset):
         self._sources = table.column("data_source").to_pylist()
         self._ground_truths = [rm["ground_truth"] for rm in table.column("reward_model").to_pylist()]
         self._extra_infos = (
-            table.column("extra_info").to_pylist() if "extra_info" in table.column_names else [None] * len(self._prompts)
+            table.column("extra_info").to_pylist()
+            if "extra_info" in table.column_names
+            else [None] * len(self._prompts)
         )
         if "videos" in table.column_names:
             videos = table.column("videos").to_pylist()
@@ -130,9 +132,7 @@ class BenchmarkDataset(Dataset):
         if config.max_samples is not None and config.max_samples < len(indices):
             indices = self._stratified_subset(indices, config.max_samples, config.seed)
         self._order = self._sort_by_prompt_len(indices)
-        logger.info(
-            f"BenchmarkDataset: {len(self._order)}/{len(self._prompts)} rows from {config.dataset_path}"
-        )
+        logger.info(f"BenchmarkDataset: {len(self._order)}/{len(self._prompts)} rows from {config.dataset_path}")
 
     def _stratified_subset(self, indices: List[int], max_samples: int, seed: int) -> List[int]:
         by_src = defaultdict(list)
@@ -186,9 +186,7 @@ class BenchmarkDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict[str, Any]:
         j = self._order[i]
-        images = [
-            Image.open(io.BytesIO(img["bytes"])).convert("RGB") for img in (self._images_col[j].as_py() or [])
-        ]
+        images = [Image.open(io.BytesIO(img["bytes"])).convert("RGB") for img in (self._images_col[j].as_py() or [])]
         messages = _build_messages(self._prompts[j], images)
         text = self.hf_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return {
