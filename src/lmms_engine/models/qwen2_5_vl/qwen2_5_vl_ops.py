@@ -35,11 +35,9 @@ from lmms_engine.parallel.sequence_parallel.ulysses import (
     ulysses_pad,
 )
 
-from ..sequence_packing_utils import (
-    BaseModelOutputWithPastAndRmpad,
-    _get_unpad_data,
-    _unpad_input,
-)
+from ..common_ops.rope import qwen2_5_vl_rope_index
+from ..common_ops.visual import parse_visual_output
+from ..sequence_packing_utils import BaseModelOutputWithPastAndRmpad, _unpad_input
 
 logger = logging.get_logger(__name__)
 
@@ -54,13 +52,9 @@ if is_flash_attn_2_available():
             unpad_input,
         )
 
-        _flash_supports_window_size = "window_size" in list(
-            inspect.signature(flash_attn_func).parameters
-        )
+        _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
     except:
-        raise ModuleNotFoundError(
-            "flash_attn is not available. Please install it via `pip install flash_attn`."
-        )
+        raise ModuleNotFoundError("flash_attn is not available. Please install it via `pip install flash_attn`.")
 
 
 @dataclass
@@ -97,26 +91,16 @@ def vl_model_forward(
     second_per_grid_ts: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
     batch_size, seq_length = input_ids.shape
     original_input_ids = input_ids
 
     # Unpad the input ids here
-    input_ids, indices, cu_seq_lens, _ = _unpad_input(
-        input_ids, attention_mask=attention_mask
-    )
+    input_ids, indices, cu_seq_lens, _ = _unpad_input(input_ids, attention_mask=attention_mask)
 
     if attention_mask is not None:
         attention_mask = attention_mask.to(input_ids.device)
@@ -124,10 +108,9 @@ def vl_model_forward(
     # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
     if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
         # calculate RoPE index once per generation in the pre-fill stage only
-        if (
-            cache_position is not None and cache_position[0] == 0
-        ) or self.rope_deltas is None:
-            position_ids, rope_deltas = self.get_rope_index(
+        if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
+            position_ids, rope_deltas = qwen2_5_vl_rope_index(
+                self,
                 original_input_ids,  # Here we use the padded input ids
                 image_grid_thw,
                 video_grid_thw,
@@ -137,11 +120,7 @@ def vl_model_forward(
             self.rope_deltas = rope_deltas
         # then use the prev pre-calculated rope-deltas to get the correct position ids
         else:
-            delta = (
-                (cache_position[0] + self.rope_deltas).to(input_ids.device)
-                if cache_position is not None
-                else 0
-            )
+            delta = (cache_position[0] + self.rope_deltas).to(input_ids.device) if cache_position is not None else 0
             position_ids = torch.arange(seq_length, device=input_ids.device)
             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
             if cache_position is not None:  # otherwise `deltas` is an int `0`
@@ -150,9 +129,7 @@ def vl_model_forward(
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
     position_ids = (
-        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
-        .transpose(0, 1)
-        .unsqueeze(1)
+        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)
     )
 
     if get_ulysses_sequence_parallel_world_size() > 1:
@@ -169,7 +146,7 @@ def vl_model_forward(
 
     if pixel_values is not None:
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = parse_visual_output(self.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -187,7 +164,7 @@ def vl_model_forward(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds = parse_visual_output(self.visual(pixel_values_videos, grid_thw=video_grid_thw))
         n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
@@ -205,9 +182,7 @@ def vl_model_forward(
 
     # Embed audio features
     if audio_values is not None:
-        audio_features, audio_output_lengths = self.prepare_audio_values(
-            audio_values, audio_attention_mask
-        )
+        audio_features, audio_output_lengths = self.prepare_audio_values(audio_values, audio_attention_mask)
         n_audio_tokens = (input_ids == self.config.audio_token_id).sum().item()
         n_audio_features = audio_output_lengths.sum()
         if n_audio_tokens != n_audio_features:
@@ -215,10 +190,7 @@ def vl_model_forward(
                 f"Audio features and image tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
             )
         audio_mask = (
-            (input_ids == self.config.audio_token_id)
-            .unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
+            (input_ids == self.config.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         )
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         # Audio feature is in (bs, max_seq_len, hidden_size)
@@ -226,16 +198,12 @@ def vl_model_forward(
         # We remove the padded values first
         unpadded_audio_features = [
             audio_feat[:audio_output_length]
-            for audio_feat, audio_output_length in zip(
-                audio_features, audio_output_lengths
-            )
+            for audio_feat, audio_output_length in zip(audio_features, audio_output_lengths)
         ]
         # Concat the audio features
         # Should exactly have audio_mask.sum() values
         unpadded_audio_features = torch.concatenate(unpadded_audio_features, dim=0)
-        inputs_embeds = inputs_embeds.masked_scatter(
-            audio_mask, unpadded_audio_features
-        )
+        inputs_embeds = inputs_embeds.masked_scatter(audio_mask, unpadded_audio_features)
 
     kwargs = {"cache_position": cache_position}
     outputs = self.language_model(
@@ -282,36 +250,24 @@ def text_model_forward(
     cu_seq_lens: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Union[Tuple, BaseModelOutputWithPastAndRmpad]:
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
     # use_cache = use_cache if use_cache is not None else self.config.use_cache
     # use_rmpad = use_rmpad if use_rmpad is not None else self.config.use_rmpad
 
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
-        raise ValueError(
-            "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
-        )
+        raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
     elif input_ids is not None:
         batch_size, seq_length = input_ids.shape
     elif inputs_embeds is not None:
         seq_length, hidden_size = inputs_embeds.shape
     else:
-        raise ValueError(
-            "You have to specify either decoder_input_ids or decoder_inputs_embeds"
-        )
+        raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
     if self.gradient_checkpointing and self.training:
         if use_cache:
@@ -336,9 +292,7 @@ def text_model_forward(
     )
     # the hard coded `3` is for temporal, height and width.
     if position_ids is None:
-        position_ids = cache_position.view(1, 1, -1).expand(
-            3, inputs_embeds.shape[0], -1
-        )
+        position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
     elif position_ids.dim() == 2:
         position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -408,11 +362,7 @@ def text_model_forward(
     next_cache = next_decoder_cache if use_cache else None
 
     if not return_dict:
-        return tuple(
-            v
-            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
-            if v is not None
-        )
+        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
     return BaseModelOutputWithPastAndRmpad(
         last_hidden_state=hidden_states,
         past_key_values=next_cache,
@@ -434,9 +384,7 @@ def decoder_layer_forward(
     use_cache: Optional[bool] = False,
     cu_seq_lens: Optional[torch.IntTensor] = None,
     indices: Optional[torch.IntTensor] = None,
-    position_embeddings: Optional[
-        List[Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,  # necessary, but kept here for BC
+    position_embeddings: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,  # necessary, but kept here for BC
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     residual = hidden_states
@@ -489,23 +437,14 @@ def attn_forward(
     **kwargs,
 ):
     ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
-    bsz = hidden_states.shape[0]
-    q_len = torch.max(position_ids).item() + 1
-    kv_seq_len = q_len
     query_states = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-    key_states = self.k_proj(hidden_states).view(
-        -1, self.num_key_value_heads, self.head_dim
-    )
-    value_states = self.v_proj(hidden_states).view(
-        -1, self.num_key_value_heads, self.head_dim
-    )
+    key_states = self.k_proj(hidden_states).view(-1, self.num_key_value_heads, self.head_dim)
+    value_states = self.v_proj(hidden_states).view(-1, self.num_key_value_heads, self.head_dim)
     # Because the input can be padded, the absolute sequence length depends on the max position id.
     cos, sin = position_embeddings
     ########## AlltoAll for Ulysses ##########
     if ulysses_sp_size > 1:
-        assert (
-            position_ids is not None
-        ), "position_ids is required for Ulysses sequence parallelism"
+        assert position_ids is not None, "position_ids is required for Ulysses sequence parallelism"
 
         # NOTE: repeat kv heads to be divided by sequence parallel. Instead of repeating nheads_q//nheads_k,
         # we choose to repeat sp_size//nheads_k, since flash_attention supports MQA/GQA.
@@ -537,17 +476,20 @@ def attn_forward(
     # Unsqueeze the first dim to apply pos embeds
     query_states = query_states.unsqueeze(0).transpose(1, 2)
     key_states = key_states.unsqueeze(0).transpose(1, 2)
+    # transformers 5.0 compatible fixing
+    if hasattr(self, "rope_scaling"):
+        mrope_section = self.rope_scaling["mrope_section"]
+    elif hasattr(self, "rope_parameters"):
+        mrope_section = self.rope_parameters["mrope_section"]
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states,
         key_states,
         cos,
         sin,
-        self.rope_scaling["mrope_section"],
+        mrope_section,
     )
 
-    max_seqlen = (
-        torch.diff(cu_seq_lens).max().item() if cu_seq_lens is not None else None
-    )
+    max_seqlen = torch.diff(cu_seq_lens).max().item() if cu_seq_lens is not None else None
 
     # Reshape to the expected shape for Flash Attention
     query_states = query_states.transpose(1, 2).squeeze(0)

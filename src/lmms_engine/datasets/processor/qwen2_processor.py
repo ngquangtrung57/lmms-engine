@@ -6,6 +6,7 @@ from PIL.Image import Image
 from transformers import AutoProcessor
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from .base_qwen2_5_processor import BaseQwen2_5_DataProcessor
 
@@ -50,6 +51,14 @@ class Qwen2DataProcessor(BaseQwen2_5_DataProcessor):
     def tokenizer(self):
         return self.processor
 
+    @property
+    def special_tokens(self):
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = DataUtilities.get_special_tokens(
+                self.processor, extra_tokens=["<|im_start|>", "<|im_end|>"]
+            )
+        return self._special_tokens
+
     def get_qwen_template_labels(
         self,
         hf_messages,
@@ -60,20 +69,16 @@ class Qwen2DataProcessor(BaseQwen2_5_DataProcessor):
         add_system_prompt: bool = True,
         add_generation_prompt: bool = False,
     ):
-        special_tokens = self.processor.additional_special_tokens
-        special_tokens.extend(["<|im_start|>", "<|im_end|>"])
-        unmask_tokens_idx = [
-            self.processor.convert_tokens_to_ids(t) for t in special_tokens
-        ]
+        unmask_tokens_idx = [self.processor.convert_tokens_to_ids(t) for t in self.special_tokens]
         input_id, target = [], []
         if add_system_prompt and hf_messages[0]["role"] != "system":
-            input_id += self.processor.apply_chat_template(
-                [{"role": "system", "content": system_message}],
+            input_id += DataUtilities.apply_chat_template(
+                self.processor, [{"role": "system", "content": system_message}]
             )
             target += [-100] * len(input_id)
         for message in hf_messages:
             role = message["role"]
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
 
             input_id += encode_id
             if role in ["user", "system"]:

@@ -95,9 +95,7 @@ def mmt_kernel(
 def matmul_transpose_assign(d_in, d_out):
     assert d_in.is_cuda, "Input `d_in` must be a CUDA tensor"
     assert d_out.is_cuda, "Input `d_out` must be a CUDA tensor"
-    assert (
-        d_in.device == d_out.device
-    ), "Inputs `d_in` and `d_out` must be on the same CUDA device"
+    assert d_in.device == d_out.device, "Inputs `d_in` and `d_out` must be on the same CUDA device"
     assert d_in.dtype == d_out.dtype, "Inputs must have the same data type"
     assert d_in.ndim == 2, "Input `d_in` must be a 2D tensor"
     assert d_out.ndim == 2, "Input `d_out` must be a 2D tensor"
@@ -107,9 +105,7 @@ def matmul_transpose_assign(d_in, d_out):
 
     d_in = d_in.contiguous()
     M, K = d_in.shape
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(M, META["BLOCK_SIZE_M"]),
-    )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(M, META["BLOCK_SIZE_M"]),)
     with torch.cuda.device(d_in.device.index):
         mmt_kernel[grid](
             d_in,
@@ -187,6 +183,15 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
     return buf1c / (buf2c.sqrt() + eps)
 
 
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True, rms_scale=False):
+    # momentum update, please consider the nesterov as True
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = fast_newtonschulz(update, steps=ns_steps)
+    update = apply_scaling(update, rms_scale)
+    return update
+
+
 class Work(Protocol):
     def __init__(self, param, state, group, index: int):
         ...
@@ -228,9 +233,7 @@ class Fsdp1dWork:
 
         dest_rank = self.index % world_size
         if rank == dest_rank:
-            gather_lists = [
-                torch.zeros_like(input=grad.to_local()) for _ in range(world_size)
-            ]
+            gather_lists = [torch.zeros_like(input=grad.to_local()) for _ in range(world_size)]
             gather_handle = gather(
                 grad.to_local(),
                 gather_lists,
@@ -241,9 +244,7 @@ class Fsdp1dWork:
 
         else:
             gather_lists = None
-            gather_handle = gather(
-                grad.to_local(), None, group_dst=dest_rank, group=pg, async_op=True
-            )
+            gather_handle = gather(grad.to_local(), None, group_dst=dest_rank, group=pg, async_op=True)
 
         self._intermediate_state = [dest_rank, gather_handle, gather_lists]
 
@@ -328,32 +329,24 @@ class SingelDeviceWork:
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self, param_groups, defaults=dict(lr=0.02), is_deepspeed_enabled=False
-    ):
+    def __init__(self, param_groups, defaults=dict(lr=0.02), is_deepspeed_enabled=False):
         self.is_deepspeed_enabled = is_deepspeed_enabled
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
-                group["params"] = sorted(
-                    group["params"], key=lambda x: x.size(), reverse=True
-                )
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
                 # defaults
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
                 rms_scale = group.get("rms_scale", True)
                 if self.is_deepspeed_enabled and rms_scale:
-                    logger.warning(
-                        "rms_scale for Muon is not supported in deepspeed, setting rms_scale to False"
-                    )
+                    logger.warning("rms_scale for Muon is not supported in deepspeed, setting rms_scale to False")
                     rms_scale = False
                 group["rms_scale"] = rms_scale
                 nesterov = group.get("nesterov", True)
                 if self.is_deepspeed_enabled and not nesterov:
-                    logger.warning(
-                        "disabled nesterov for Muon is not supported in deepspeed, setting nesterov to True"
-                    )
+                    logger.warning("disabled nesterov for Muon is not supported in deepspeed, setting nesterov to True")
                     nesterov = False
                 group["nesterov"] = nesterov
                 group["ns_steps"] = group.get("ns_steps", 5)
@@ -375,9 +368,7 @@ class Muon(torch.optim.Optimizer):
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == set(
-                    ["params", "lr", "betas", "eps", "weight_decay", "use_muon"]
-                )
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
         super().__init__(param_groups, defaults=defaults)
 
     def _get_work_class(self, p: torch.Tensor) -> tuple[type[Work], int]:
@@ -489,70 +480,3 @@ class Muon(torch.optim.Optimizer):
             work.finish()
 
         return loss
-        # loss = None
-        # if closure is not None:
-        #     with torch.enable_grad():
-        #         loss = closure()
-        # for group in self.param_groups:
-        #     if group["use_muon"]:
-        #         params: list[Tensor] = group["params"]
-        #         update_buffer: Tensor = group["update_buffer"]
-        #         update_buffer_views: list[Tensor] = group["update_buffer_views"]
-
-        #         handle = None
-        #         params_world = None
-        #         weight_decays_world = None
-
-        #         def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-        #             handle.wait()
-        #             for p_world, g_world, weight_decay in zip(params_world, update_buffer_views, weight_decays_world):
-        #                 alpha = -group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5
-        #                 p_world.mul_(1 - group["lr"] * group["weight_decays"])
-        #                 p_world.add_(
-        #                     g_world.view_as(p_world),
-        #                     alpha=alpha
-        #                 )
-
-        #         for base_i in range(len(params))[::self.world_size]:
-        #             if base_i + self.rank < len(params):
-        #                 p = params[base_i + self.rank]
-        #                 g = p.grad
-        #                 assert g is not None
-        #                 assert p.shape == g.shape
-        #                 state = self.state[p]
-        #                 if "momentum_buffer" not in state:
-        #                     state["momentum_buffer"] = torch.zeros_like(g)
-
-        #                 buf: Tensor = state["momentum_buffer"]
-        #                 buf.lerp_(g, 1 - group["beta"])
-        #                 g = g.lerp_(buf, group["beta"]) if group["nesterov"] else buf
-        #                 g = fast_newtonschulz(g, steps=group["ns_steps"]).flatten()
-        #             else:
-        #                 g = update_buffer_views[self.rank]
-        #             if base_i > 0:
-        #                 update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-        #             handle = all_gather_into_tensor(update_buffer, g, async_op=True)
-        #             params_world = params[base_i : base_i + self.world_size]
-        #             weight_decays_world = weight_decays[base_i : base_i + self.world_size]
-        #         update_prev()
-        #     else:
-        #         for p in group["params"]:
-        #             g = p.grad
-        #             assert g is not None
-        #             state = self.state[p]
-        #             if "step" not in state: state["step"] = 0
-        #             if "momentum_buffer" not in state: state["momentum_buffer"] = torch.zeros_like(g)
-        #             if "momentum_sq_buffer" not in state: state["momentum_sq_buffer"] = torch.zeros_like(g)
-        #             m: Tensor = state["momentum_buffer"]
-        #             v: Tensor = state["momentum_sq_buffer"]
-        #             m.lerp_(g, 1 - group["adam_beta1"])
-        #             v.mul_(group["adam_beta2"]).addcmul_(g, g, value=1.0 - group["adam_beta2"])
-        #             state["step"] += 1
-        #             bias_correction1 = 1.0 - group["adam_beta1"] ** state["step"]
-        #             bias_correction2 = 1.0 - group["adam_beta2"] ** state["step"]
-        #             step_size = group["lr"] * (bias_correction2) ** 0.5 / bias_correction1
-        #             norm_grad = m / (v.sqrt().add_(group["adam_eps"]))
-        #             if weight_decay > 0.0:
-        #                 p.add_(p, alpha=(-group["lr"] * group["weight_decays"]))
-        #             p.add_(norm_grad, alpha=-step_size)
-        # return loss

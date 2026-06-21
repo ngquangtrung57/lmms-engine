@@ -1,9 +1,11 @@
+import random
 from typing import List, Optional
 
 import numpy as np
 import torch
+from loguru import logger
 from PIL import Image
-from transformers import Qwen2Tokenizer
+from transformers import Qwen2Tokenizer, set_seed
 
 from lmms_engine.mapping_func import register_processor
 from lmms_engine.models.bagel.data_utils import (
@@ -22,57 +24,55 @@ from .config import ProcessorConfig
 class BagelDataProcessor:
     def __init__(self, config: ProcessorConfig) -> None:
         self.config = config
-        self.vit_patch_size = getattr(self.config.extra_kwargs, "vit_patch_size", 14)
-        self.max_num_patch_per_side = getattr(
-            self.config.extra_kwargs, "max_num_patch_per_side", 70
-        )
-        self.interpolate_pos = getattr(
-            self.config.extra_kwargs, "interpolate_pos", False
-        )
+        extra_kwargs = getattr(self.config, "extra_kwargs", None) or {}
+        self.vit_patch_size = int(extra_kwargs.get("vit_patch_size", 14))
+        self.max_num_patch_per_side = int(extra_kwargs.get("max_num_patch_per_side", 70))
+        self.interpolate_pos = bool(extra_kwargs.get("interpolate_pos", False))
         if self.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
         # Default latent * downsample = 2 * 8
-        self.vae_image_downsample = getattr(
-            self.config.extra_kwargs, "vae_image_downsample", 16
-        )
-        self.max_latent_size = getattr(self.config.extra_kwargs, "max_latent_size", 64)
+        self.vae_image_downsample = int(extra_kwargs.get("vae_image_downsample", 16))
+        self.max_latent_size = int(extra_kwargs.get("max_latent_size", 64))
+
+        self.text_cond_dropout_prob = float(extra_kwargs.get("text_cond_dropout_prob", 0.0))
+        self.vit_cond_dropout_prob = float(extra_kwargs.get("vit_cond_dropout_prob", 0.0))
+        self.vae_cond_dropout_prob = float(extra_kwargs.get("vae_cond_dropout_prob", 0.0))
+
+        self.user_image_as_vae_condition = extra_kwargs.get("user_image_as_vae_condition", None)
+        self.set_random_seed(extra_kwargs.get("random_seed", 4396))
 
     def build(self):
         self.processor = self._build_processor()
 
+    def set_random_seed(self, seed: int):
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+        seed = seed * world_size + rank
+        logger.info(f"Set random seed to {seed} for rank {rank} in world size {world_size}")
+        set_seed(seed)
+
     def _build_processor(self):
+        extra_kwargs = getattr(self.config, "extra_kwargs", None) or {}
         processor = Qwen2Tokenizer.from_pretrained(self.config.processor_name)
-        processor, self.new_token_ids, self.num_new_tokens = self.add_special_tokens(
-            processor
-        )
-        self.vae_image_stride = getattr(
-            self.config.extra_kwargs, "vae_image_stride", 16
-        )
-        self.vae_max_image_size = getattr(
-            self.config.extra_kwargs, "vae_max_image_size", 1024
-        )
-        self.vae_min_image_size = getattr(
-            self.config.extra_kwargs, "vae_min_image_size", 512
-        )
+        processor, self.new_token_ids, self.num_new_tokens = self.add_special_tokens(processor)
+        self.vae_image_stride = int(extra_kwargs.get("vae_image_stride", 16))
+        self.vae_max_image_size = int(extra_kwargs.get("vae_max_image_size", 1024))
+        self.vae_min_image_size = int(extra_kwargs.get("vae_min_image_size", 512))
         self.vae_image_transform = ImageTransform(
             image_stride=self.vae_image_stride,
             max_image_size=self.vae_max_image_size,
             min_image_size=self.vae_min_image_size,
         )
-        self.vit_image_stride = getattr(
-            self.config.extra_kwargs, "vit_image_stride", 14
-        )
-        self.vit_max_image_size = getattr(
-            self.config.extra_kwargs, "vit_max_image_size", 512
-        )
-        self.vit_min_image_size = getattr(
-            self.config.extra_kwargs, "vit_min_image_size", 378
-        )
-        self.vit_max_pixels = getattr(
-            self.config.extra_kwargs, "vit_max_pixels", 2_007_040
-        )
+        self.vit_image_stride = int(extra_kwargs.get("vit_image_stride", 14))
+        self.vit_max_image_size = int(extra_kwargs.get("vit_max_image_size", 512))
+        self.vit_min_image_size = int(extra_kwargs.get("vit_min_image_size", 378))
+        self.vit_max_pixels = int(extra_kwargs.get("vit_max_pixels", 2_007_040))
         self.vit_image_transform = ImageTransform(
             image_stride=self.vit_image_stride,
             max_image_size=self.vit_max_image_size,
@@ -83,9 +83,7 @@ class BagelDataProcessor:
 
     def save_pretrained(self, save_directory: str):
         if not hasattr(self, "processor"):
-            raise ValueError(
-                "Processor has not been built yet. Please call build() first."
-            )
+            raise ValueError("Processor has not been built yet. Please call build() first.")
         # Build a clean processor for saving
         new_processor = self._build_processor()
         new_processor.save_pretrained(save_directory)
@@ -114,19 +112,25 @@ class BagelDataProcessor:
         full_attn_modes = []
         split_lens = []
 
+        use_user_vae_cond = self.user_image_as_vae_condition
+        if use_user_vae_cond is None:
+            has_assistant_image = any(
+                (m.get("role") == "assistant") and any((c.get("type") == "image") for c in (m.get("content") or []))
+                for m in hf_messages
+            )
+            use_user_vae_cond = has_assistant_image
+
         for message in hf_messages:
             role = message["role"]
             for content in message["content"]:
-                curr_split_len = 0
-                if content["type"] == "text":
+                ctype = content.get("type")
+                if ctype == "text":
+                    if role != "assistant" and self.text_cond_dropout_prob > 0:
+                        if random.random() < self.text_cond_dropout_prob:
+                            continue
+                    curr_split_len = 0
                     curr_text = content["text"]
-                    (
-                        attn_modes,
-                        sequence_status,
-                        curr,
-                        curr_split_len,
-                        curr_rope_id,
-                    ) = self.process_text(
+                    attn_modes, sequence_status, curr, curr_split_len, curr_rope_id = self.process_text(
                         curr_text,
                         role,
                         sequence_status,
@@ -134,52 +138,71 @@ class BagelDataProcessor:
                         curr_split_len,
                         curr_rope_id,
                     )
-                elif content["type"] == "image" and role == "assistant":
+                    full_attn_modes.extend(attn_modes)
+                    split_lens.append(curr_split_len)
+                    continue
+                if ctype == "image":
                     curr_image = images[image_index]
                     image_index += 1
-                    # process_order.append("vae_image", role)
-                    (
-                        attn_modes,
-                        sequence_status,
-                        curr,
-                        curr_split_len,
-                        curr_rope_id,
-                    ) = self.process_vae_image(
-                        curr_image,
-                        role,
-                        sequence_status,
-                        curr_rope_id=curr_rope_id,
-                        curr=curr,
-                        curr_split_len=curr_split_len,
-                    )
-                elif content["type"] == "image" and role == "user":
-                    curr_image = images[image_index]
-                    image_index += 1
-                    # process_order.append("vit_image")
-                    (
-                        attn_modes,
-                        sequence_status,
-                        curr,
-                        curr_split_len,
-                        curr_rope_id,
-                    ) = self.process_vit_image(
-                        curr_image,
-                        role,
-                        sequence_status,
-                        curr_rope_id=curr_rope_id,
-                        curr=curr,
-                        curr_split_len=curr_split_len,
-                    )
-
-                full_attn_modes.extend(attn_modes)
-                split_lens.append(curr_split_len)
+                    if role == "assistant":
+                        curr_split_len = 0
+                        attn_modes, sequence_status, curr, curr_split_len, curr_rope_id = self.process_vae_image(
+                            curr_image,
+                            role,
+                            sequence_status,
+                            curr_rope_id=curr_rope_id,
+                            curr=curr,
+                            curr_split_len=curr_split_len,
+                            need_loss=True,
+                        )
+                        full_attn_modes.extend(attn_modes)
+                        split_lens.append(curr_split_len)
+                        continue
+                    if role == "user":
+                        if use_user_vae_cond:
+                            if self.vae_cond_dropout_prob > 0 and random.random() < self.vae_cond_dropout_prob:
+                                # Match original: when dropping a VAE-condition image, still advance the rope id.
+                                curr_rope_id += 1
+                            else:
+                                curr_split_len = 0
+                                (
+                                    attn_modes,
+                                    sequence_status,
+                                    curr,
+                                    curr_split_len,
+                                    curr_rope_id,
+                                ) = self.process_vae_image(
+                                    curr_image,
+                                    role,
+                                    sequence_status,
+                                    curr_rope_id=curr_rope_id,
+                                    curr=curr,
+                                    curr_split_len=curr_split_len,
+                                    need_loss=False,
+                                )
+                                full_attn_modes.extend(attn_modes)
+                                split_lens.append(curr_split_len)
+                        if self.vit_cond_dropout_prob > 0 and random.random() < self.vit_cond_dropout_prob:
+                            curr_rope_id += 1
+                        else:
+                            curr_split_len = 0
+                            attn_modes, sequence_status, curr, curr_split_len, curr_rope_id = self.process_vit_image(
+                                curr_image,
+                                role,
+                                sequence_status,
+                                curr_rope_id=curr_rope_id,
+                                curr=curr,
+                                curr_split_len=curr_split_len,
+                            )
+                            full_attn_modes.extend(attn_modes)
+                            split_lens.append(curr_split_len)
+                        continue
+                continue
 
         sequence_status["attn_modes"] = full_attn_modes
         sequence_status["curr"] = curr
         sequence_status["sample_lens"].append(sum(split_lens))
-        sequence_status["nested_attention_masks"].append(
-            prepare_attention_mask_per_sample(split_lens, full_attn_modes)
-        )
+        sequence_status["nested_attention_masks"].append(prepare_attention_mask_per_sample(split_lens, full_attn_modes))
         data = self.to_tensor(sequence_status)
         # Fake input ids for packing
         data["input_ids"] = torch.zeros(data["sequence_length"], dtype=torch.long)
@@ -202,16 +225,10 @@ class BagelDataProcessor:
         text_ids = self.processor.encode(text)
         shifted_text_ids = [self.bos_token_id] + text_ids
         sequence_status["packed_text_ids"].extend(shifted_text_ids)
-        sequence_status["packed_text_indexes"].extend(
-            range(curr, curr + len(shifted_text_ids))
-        )
+        sequence_status["packed_text_indexes"].extend(range(curr, curr + len(shifted_text_ids)))
         if role == "assistant":
-            sequence_status["ce_loss_indexes"].extend(
-                range(curr, curr + len(shifted_text_ids))
-            )
-            sequence_status["ce_loss_weights"].extend(
-                [len2weight(len(shifted_text_ids))] * len(shifted_text_ids)
-            )
+            sequence_status["ce_loss_indexes"].extend(range(curr, curr + len(shifted_text_ids)))
+            sequence_status["ce_loss_weights"].extend([len2weight(len(shifted_text_ids))] * len(shifted_text_ids))
             sequence_status["packed_label_ids"].extend(text_ids + [self.eos_token_id])
         curr += len(shifted_text_ids)
         curr_split_len += len(shifted_text_ids)
@@ -224,9 +241,7 @@ class BagelDataProcessor:
 
         # update sequence status
         attn_modes.append("causal")
-        sequence_status["packed_position_ids"].extend(
-            range(curr_rope_id, curr_rope_id + curr_split_len)
-        )
+        sequence_status["packed_position_ids"].extend(range(curr_rope_id, curr_rope_id + curr_split_len))
         curr_rope_id += curr_split_len
         return attn_modes, sequence_status, curr, curr_split_len, curr_rope_id
 
@@ -239,6 +254,7 @@ class BagelDataProcessor:
         curr_rope_id: int,
         curr: int,
         curr_split_len: int,
+        need_loss: bool = True,
     ):
         image_tensor = self.vae_image_transform(image.convert("RGB"))
         attn_modes = []
@@ -264,11 +280,14 @@ class BagelDataProcessor:
         sequence_status["vae_latent_shapes"].append((h, w))
 
         num_img_tokens = w * h
-        sequence_status["packed_vae_token_indexes"].extend(
-            range(curr, curr + num_img_tokens)
-        )
-        sequence_status["mse_loss_indexes"].extend(range(curr, curr + num_img_tokens))
-        timestep = np.random.randn()
+        sequence_status["packed_vae_token_indexes"].extend(range(curr, curr + num_img_tokens))
+        if need_loss:
+            # Supervised image generation/editing target (align with original: loss=1).
+            sequence_status["mse_loss_indexes"].extend(range(curr, curr + num_img_tokens))
+            timestep = np.random.randn()
+        else:
+            # VAE-condition image (align with original: loss=0, timestep=-inf -> sigmoid=0 -> clean latent condition).
+            timestep = float("-inf")
 
         sequence_status["packed_timesteps"].extend([timestep] * num_img_tokens)
         curr += num_img_tokens
@@ -280,10 +299,13 @@ class BagelDataProcessor:
         curr += 1
         curr_split_len += 1
 
-        attn_modes.append("noise")
-        sequence_status["packed_position_ids"].extend(
-            [curr_rope_id] * (num_img_tokens + 2)
-        )
+        sequence_status["packed_position_ids"].extend([curr_rope_id] * (num_img_tokens + 2))
+        if need_loss:
+            attn_modes.append("noise")
+        else:
+            # Match original: vae_image(loss=0) uses full attention and advances rope id by 1.
+            attn_modes.append("full")
+            curr_rope_id += 1
 
         return attn_modes, sequence_status, curr, curr_split_len, curr_rope_id
 
@@ -308,9 +330,7 @@ class BagelDataProcessor:
         # add the image tensor
         vit_tokens = patchify(image_tensor, self.vit_patch_size)
         num_img_tokens = vit_tokens.shape[0]
-        sequence_status["packed_vit_token_indexes"].extend(
-            range(curr, curr + num_img_tokens)
-        )
+        sequence_status["packed_vit_token_indexes"].extend(range(curr, curr + num_img_tokens))
         curr += num_img_tokens
         curr_split_len += num_img_tokens
 
@@ -388,33 +408,19 @@ class BagelDataProcessor:
             max_image_size = [max(item) for item in list(zip(*image_sizes))]
             padded_images = torch.zeros(size=(len(image_tensors), *max_image_size))
             for i, image_tensor in enumerate(image_tensors):
-                padded_images[
-                    i, :, : image_tensor.shape[1], : image_tensor.shape[2]
-                ] = image_tensor
+                padded_images[i, :, : image_tensor.shape[1], : image_tensor.shape[2]] = image_tensor
 
             data["padded_images"] = padded_images
             data["patchified_vae_latent_shapes"] = sequence_status["vae_latent_shapes"]
-            data["packed_latent_position_ids"] = torch.cat(
-                sequence_status["packed_latent_position_ids"], dim=0
-            )
-            data["packed_vae_token_indexes"] = torch.tensor(
-                sequence_status["packed_vae_token_indexes"]
-            )
+            data["packed_latent_position_ids"] = torch.cat(sequence_status["packed_latent_position_ids"], dim=0)
+            data["packed_vae_token_indexes"] = torch.tensor(sequence_status["packed_vae_token_indexes"])
 
         # if the model has a vit (e.g., as visual tokenizer)
         if len(sequence_status["packed_vit_tokens"]) > 0:
-            data["packed_vit_tokens"] = torch.cat(
-                sequence_status["packed_vit_tokens"], dim=0
-            )
-            data["packed_vit_position_ids"] = torch.cat(
-                sequence_status["packed_vit_position_ids"], dim=0
-            )
-            data["packed_vit_token_indexes"] = torch.tensor(
-                sequence_status["packed_vit_token_indexes"]
-            )
-            data["vit_token_seqlens"] = torch.tensor(
-                sequence_status["vit_token_seqlens"]
-            )
+            data["packed_vit_tokens"] = torch.cat(sequence_status["packed_vit_tokens"], dim=0)
+            data["packed_vit_position_ids"] = torch.cat(sequence_status["packed_vit_position_ids"], dim=0)
+            data["packed_vit_token_indexes"] = torch.tensor(sequence_status["packed_vit_token_indexes"])
+            data["vit_token_seqlens"] = torch.tensor(sequence_status["vit_token_seqlens"])
 
         # if the model is required to perform visual generation
         if len(sequence_status["packed_timesteps"]) > 0:
@@ -435,9 +441,7 @@ class BagelDataProcessor:
         if image_token is None:
             return None
         else:
-            return self.processor.tokenizer.convert_tokens_to_ids(
-                self.processor.image_token
-            )
+            return self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
 
     @property
     def video_token_id(self):
@@ -445,9 +449,7 @@ class BagelDataProcessor:
         if video_token is None:
             return None
         else:
-            return self.processor.tokenizer.convert_tokens_to_ids(
-                self.processor.video_token
-            )
+            return self.processor.tokenizer.convert_tokens_to_ids(self.processor.video_token)
 
     @property
     def tokenizer(self):

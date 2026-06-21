@@ -21,6 +21,51 @@ FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
 
 
+def _safe_concatenate_datasets(data_list):
+    """Concatenate datasets with automatic schema alignment.
+
+    When loading multiple parquet files, schema mismatches can occur if columns
+    have different inferred types (e.g., a struct column is null in one file but
+    has nested fields in another). This function handles such cases by casting
+    all datasets to a unified schema before concatenation.
+
+    Args:
+        data_list: List of HuggingFace Dataset objects to concatenate.
+
+    Returns:
+        A single concatenated Dataset.
+    """
+    if len(data_list) <= 1:
+        return concatenate_datasets(data_list)
+    try:
+        return concatenate_datasets(data_list)
+    except Exception as e:
+        logger.warning(
+            f"Direct concatenation failed due to schema mismatch: {e}. " f"Attempting schema alignment via cast."
+        )
+        # Use the first dataset's features as the target schema and cast others to match.
+        # This avoids the memory overhead of to_list() on large datasets.
+        target_features = data_list[0].features
+        aligned = [data_list[0]]
+        for ds in data_list[1:]:
+            try:
+                aligned.append(ds.cast(target_features))
+            except Exception:
+                # If cast to first dataset's schema fails, build a merged
+                # feature set from all datasets, preferring non-null types.
+                from datasets import Features
+
+                merged = {}
+                for d in data_list:
+                    for col_name, col_type in d.features.items():
+                        if col_name not in merged or str(merged[col_name]) == "Value(dtype='null')":
+                            merged[col_name] = col_type
+                merged_features = Features(merged)
+                aligned = [d.cast(merged_features) for d in data_list]
+                break
+        return concatenate_datasets(aligned)
+
+
 class DataUtilities:
     @staticmethod
     def load_json(path: str) -> List[Dict[str, List]]:
@@ -92,13 +137,9 @@ class DataUtilities:
             data_types = [dataset.get("data_type") for dataset in datasets]
             with Pool(cpu_count()) as p:
                 logger.info("Loading data with multiprocess...")
-                nested_data_list = list(
-                    p.imap(DataUtilities.wrap_func, zip(data_paths, data_types))
-                )
+                nested_data_list = list(p.imap(DataUtilities.wrap_func, zip(data_paths, data_types)))
 
-            for data, data_folder, data_path in zip(
-                nested_data_list, data_folders, data_paths
-            ):
+            for data, data_folder, data_path in zip(nested_data_list, data_folders, data_paths):
                 logger.info(f"Data : {data_path}")
                 if isinstance(data, Dataset):
                     data_list.append(data)
@@ -108,7 +149,7 @@ class DataUtilities:
                     data_list.append(data)
                 logger.info(f"Dataset size: {len(data)}")
                 data_folder_list.extend([data_folder] * len(data))
-            data_list = concatenate_datasets(data_list)
+            data_list = _safe_concatenate_datasets(data_list)
         return data_list, data_folder_list
 
     @staticmethod
@@ -136,16 +177,12 @@ class DataUtilities:
             int: the number of frames for video used for model inputs.
         """
         min_frames = DataUtilities.ceil_by_factor(FPS_MIN_FRAMES, FRAME_FACTOR)
-        max_frames = DataUtilities.floor_by_factor(
-            min(FPS_MAX_FRAMES, total_frames), FRAME_FACTOR
-        )
+        max_frames = DataUtilities.floor_by_factor(min(FPS_MAX_FRAMES, total_frames), FRAME_FACTOR)
         nframes = total_frames / video_fps * fps
         nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
         nframes = DataUtilities.floor_by_factor(nframes, FRAME_FACTOR)
         if not (FRAME_FACTOR <= nframes and nframes <= total_frames):
-            raise ValueError(
-                f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}."
-            )
+            raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}.")
         return nframes
 
     @staticmethod
@@ -179,9 +216,7 @@ class DataUtilities:
                     blob = bucket.blob(source_blob_name)
                     blob.download_to_file(file_obj)
                 elif storage_type == "azure":
-                    blob_client = storage_client.get_blob_client(
-                        container=bucket_name, blob=source_blob_name
-                    )
+                    blob_client = storage_client.get_blob_client(container=bucket_name, blob=source_blob_name)
                     blob_client.download_blob().readinto(file_obj)
                 break
             except Exception as e:
@@ -192,12 +227,8 @@ class DataUtilities:
         return file_obj
 
     @staticmethod
-    def resample_audio(
-        audio_array: np.ndarray, original_sr: int, target_sr: int
-    ) -> np.ndarray:
-        audio_resample_array = resample(
-            audio_array, orig_sr=original_sr, target_sr=target_sr
-        )
+    def resample_audio(audio_array: np.ndarray, original_sr: int, target_sr: int) -> np.ndarray:
+        audio_resample_array = resample(audio_array, orig_sr=original_sr, target_sr=target_sr)
         return audio_resample_array
 
     @staticmethod
@@ -224,13 +255,9 @@ class DataUtilities:
 
         with Pool(cpu_count()) as p:
             logger.info("Loading data with multiprocess...")
-            nested_data_list = list(
-                p.imap(DataUtilities.wrap_func, zip(data_paths, data_types))
-            )
+            nested_data_list = list(p.imap(DataUtilities.wrap_func, zip(data_paths, data_types)))
 
-        for data, data_folder, data_path in zip(
-            nested_data_list, data_folders, data_paths
-        ):
+        for data, data_folder, data_path in zip(nested_data_list, data_folders, data_paths):
             logger.info(f"Data : {data_path}")
             if isinstance(data, Dataset):
                 data_list.append(data)
@@ -240,6 +267,29 @@ class DataUtilities:
                 data_list.append(data)
             logger.info(f"Dataset size: {len(data)}")
             data_folder_list.extend([data_folder] * len(data))
-        data_list = concatenate_datasets(data_list)
+        data_list = _safe_concatenate_datasets(data_list)
 
         return data_list, data_folder_list
+
+    @staticmethod
+    def apply_chat_template(hf_processor, messages: List[Dict], use_key: str = "input_ids", tokenize: bool = True):
+        result = hf_processor.apply_chat_template(messages, tokenize=tokenize)
+        if hasattr(result, "get"):
+            if use_key == "all":
+                return result
+            return result.get(use_key)
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+            return result[0]
+        return result
+
+    @staticmethod
+    def get_special_tokens(tokenizer, extra_tokens=None):
+        if hasattr(tokenizer, "all_special_tokens"):
+            tokens = list(tokenizer.all_special_tokens)
+        else:
+            tokens = list(tokenizer.additional_special_tokens)
+        if extra_tokens:
+            for t in extra_tokens:
+                if t not in tokens:
+                    tokens.append(t)
+        return tokens

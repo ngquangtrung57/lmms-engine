@@ -167,5 +167,13 @@ wandb/
 playground/
 .deepspeed_env
 output/
+outputs/
+trainer_output/
 checkpoints/
 .vscode
+*.pth
+
+# macOS
+.DS_Store
+.vscode
+docs/superpowers

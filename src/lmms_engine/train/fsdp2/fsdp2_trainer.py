@@ -1,10 +1,11 @@
 import gc
+import json
 import os
 import random
 import shutil
 import time
 from functools import partial
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ import torch.nn as nn
 from accelerate.utils import send_to_device
 from loguru import logger
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.utils.data import Dataset, DistributedSampler, IterableDataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
@@ -21,9 +22,22 @@ from transformers.trainer_utils import seed_worker
 
 import lmms_engine.models.utils as model_utils
 import lmms_engine.parallel.process_group_manager as pgm
+from lmms_engine.eval.backends import EvalServerBackend
+from lmms_engine.eval.benchmark import (
+    BenchmarkDataset,
+    BenchmarkEvalConfig,
+    GenerationCollator,
+    aggregate_benchmark_results,
+    dedupe_by_idx,
+    load_reward_fn,
+    score_generation,
+)
+from lmms_engine.models.monkey_patch import MONKEY_PATCHER
+from lmms_engine.parallel.parallelize import MODEL_TO_PARALLEL_METHOD, apply_parallelize
 from lmms_engine.train.config import TrainingArguments
 from lmms_engine.train.registry import TRAINER_REGISTER
-from lmms_engine.utils import TrainUtilities
+from lmms_engine.utils import ComputeTracker, TrainUtilities
+from lmms_engine.utils.ema_utils import EMAHelper
 from lmms_engine.utils.fsdp2_utils import (
     apply_fsdp2,
     fsdp2_clip_grad_norm_,
@@ -32,7 +46,11 @@ from lmms_engine.utils.fsdp2_utils import (
     get_cosine_schedule_with_warmup,
     get_wsd_schedule_with_warmup,
 )
-from lmms_engine.utils.profiler import StepProfiler
+from lmms_engine.utils.profiler import (
+    CudaEventProfiler,
+    MemorySnapshotProfiler,
+    StepProfiler,
+)
 from lmms_engine.utils.tracking import Tracking
 
 DatasetType = Union[Dataset, IterableDataset]
@@ -70,20 +88,66 @@ class FSDP2SFTTrainer:
             profiler_config=self.profiler_config,
             rank=dist.get_rank(),
         )
+        # CUDA memory snapshot profiler (auto-dumps on OOM)
+        self.memory_snapshot_profiler = MemorySnapshotProfiler(
+            enable=getattr(self.args, "enable_memory_snapshot", False),
+            directory=os.path.join(self.args.output_dir, "memory_snapshot"),
+            rank=dist.get_rank(),
+            memory_snapshot_config=getattr(self.args, "memory_snapshot_config", None),
+        )
+        self.cuda_event_profiler = CudaEventProfiler(
+            enable=getattr(self.args, "enable_cuda_event_profiler", False),
+            directory=os.path.join(self.args.output_dir, "cuda_event_profiler"),
+            profiler_config=getattr(self.args, "cuda_event_profiler_config", None),
+            rank=dist.get_rank(),
+        )
+        self.accumulated_grad_steps = 0
+
+        # Optional EMA (fully opt-in)
+        self.ema = EMAHelper(self.args)
+
+        # send_to_device uses non_blocking=True to overlap H2D with the next
+        # training step. This requires pinned memory; pageable memory falls
+        # back to a synchronous copy and the flag becomes a no-op.
+        if not self.args.dataloader_pin_memory:
+            logger.warning(
+                "send_to_device uses non_blocking=True but dataloader_pin_memory "
+                "is False; H2D copies will fall back to synchronous. Enable "
+                "dataloader_pin_memory for best throughput."
+            )
+
+        # Optional Eval Server Backend (only on rank 0)
+        self.eval_backend = None
+        if dist.get_rank() == 0 and self.args.eval_config is not None and self.args.eval_strategy != "no":
+            self.eval_backend = EvalServerBackend(
+                url=self.args.eval_config.get("server_url"),
+                poll_interval=self.args.eval_config.get("poll_interval", 20.0),
+                eval_config=self.args.eval_config,
+            )
+            assert self.args.eval_steps == self.args.save_steps, "eval_steps must be equal to save_steps"
+
+        # Optional in-loop benchmark eval (generation + rule scoring; ALL ranks
+        # participate -- generation forwards are FSDP collectives).
+        self.benchmark_config = None
+        if self.args.benchmark_eval is not None:
+            self.benchmark_config = BenchmarkEvalConfig.from_dict(self.args.benchmark_eval)
+        self.benchmark_dataloader = None
+        self.benchmark_reward_fn = None
 
     def prepare_dataloader(self, dataset: DatasetType, is_training: bool = True):
         data_collator = self.data_collator
+        # Eval uses per_device_eval_batch_size; keep persistent workers for training only.
+        batch_size = self.args.train_batch_size if is_training else self.args.eval_batch_size
         dataloader_params = {
-            "batch_size": self.args.train_batch_size,
+            "batch_size": batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
+            "persistent_workers": self.args.dataloader_persistent_workers and is_training,
         }
-
         if isinstance(dataset, IterableDataset):
             sampler = None
-        elif self.args.group_by_length:
+        elif is_training and self.args.group_by_length:
             sampler = DistributedLengthGroupedSampler(
                 self.args.train_batch_size * self.args.gradient_accumulation_steps,
                 dataset=dataset,
@@ -93,13 +157,18 @@ class FSDP2SFTTrainer:
                 rank=pgm.process_group_manager.dp_rank,
             )
         else:
+            # Eval: shuffle off (deterministic) and drop_last on the SAMPLER so every rank
+            # gets the SAME number of samples -> equal FSDP forward steps -> no collective
+            # deadlock (FSDP param all-gather is collective; ragged per-rank counts hang).
             sampler = DistributedSampler(
                 dataset,
                 num_replicas=pgm.process_group_manager.dp_world_size,
                 rank=pgm.process_group_manager.dp_rank,
+                shuffle=is_training,
+                drop_last=not is_training,
             )
         dataloader_params["sampler"] = sampler
-        dataloader_params["drop_last"] = self.args.dataloader_drop_last
+        dataloader_params["drop_last"] = self.args.dataloader_drop_last if is_training else True
         dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
         if is_training:
             dataloader_params["worker_init_fn"] = partial(
@@ -111,15 +180,23 @@ class FSDP2SFTTrainer:
         return dataloader
 
     def prepare_model(self):
+        model_type = getattr(self.model.config, "model_type", None)
+        if model_type in MODEL_TO_PARALLEL_METHOD and pgm.process_group_manager.enable_parallel:
+            assert not pgm.process_group_manager.enable_hsdp, (
+                "HSDP is not yet supported with the parallelize path "
+                "(TP/CP/EP). Set hsdp_shard_size=0 or disable parallelism."
+            )
+            apply_parallelize(self.model, model_type, self.args)
+            self.fsdp2_model = self.model
+            return
+
         if self.args.bf16:
             param_dtype = torch.bfloat16
         else:
             param_dtype = torch.float16
 
         if self.args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         reduce_dtype = getattr(torch, self.args.reduce_dtype)
         output_dtype = getattr(torch, self.args.output_dtype)
@@ -130,15 +207,12 @@ class FSDP2SFTTrainer:
         )
 
         fsdp_kwargs = {
-            "reshard_after_forward": getattr(self.args, "fsdp_config", {}).get(
-                "reshard_after_forward", True
-            ),
+            "reshard_after_forward": getattr(self.args, "fsdp_config", {}).get("reshard_after_forward", True),
             "mp_policy": mp_policy,
+            "mesh": pgm.process_group_manager.fsdp_mesh,
         }
 
-        transformer_cls_names_to_wrap = self.args.fsdp_config.get(
-            "transformer_layer_cls_to_wrap", None
-        )
+        transformer_cls_names_to_wrap = self.args.fsdp_config.get("transformer_layer_cls_to_wrap", None)
         full_state = self.model.state_dict()
         logger.info(f"Applying FSDP2 to model")
         apply_fsdp2(self.model, fsdp_kwargs, transformer_cls_names_to_wrap)
@@ -146,6 +220,10 @@ class FSDP2SFTTrainer:
         fsdp2_load_full_state_dict(self.model, full_state)
         logger.info(f"FSDP2 applied to model")
         self.fsdp2_model = self.model
+
+        del full_state
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def prepare_optimizer(self):
         self.optimizer = torch.optim.AdamW(
@@ -161,6 +239,7 @@ class FSDP2SFTTrainer:
         num_warmup_steps: int,
         num_training_steps: int,
     ):
+        self.args.lr_scheduler_kwargs = self.args.lr_scheduler_kwargs or {}
         if self.args.lr_scheduler_type == "cosine":
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -182,9 +261,7 @@ class FSDP2SFTTrainer:
                 **self.args.lr_scheduler_kwargs,
             )
         else:
-            raise ValueError(
-                f"Unsupported lr_scheduler_type: {self.args.lr_scheduler_type}"
-            )
+            raise ValueError(f"Unsupported lr_scheduler_type: {self.args.lr_scheduler_type}")
 
     def compute_loss(self, batch):
         if self.args.bf16:
@@ -198,53 +275,79 @@ class FSDP2SFTTrainer:
 
     def training_step(self, batch):
         self.fsdp2_model.train()
-        self.optimizer.zero_grad()
+        if self.accumulated_grad_steps == 0:
+            self.optimizer.zero_grad()
         loss = self.compute_loss(batch)
         if dist.get_world_size() > 1:
             loss = loss.mean()
-        loss_item = loss.item()
+        loss = loss / self.args.gradient_accumulation_steps
+        loss_item = loss.item() * self.args.gradient_accumulation_steps
         loss.backward()
-        grad_norm = fsdp2_clip_grad_norm_(
-            self.fsdp2_model.parameters(), self.args.max_grad_norm
-        )
+        self.accumulated_grad_steps += 1
+        should_update = self.accumulated_grad_steps >= self.args.gradient_accumulation_steps
+        grad_norm = None
+        if should_update:
+            grad_norm = fsdp2_clip_grad_norm_(self.fsdp2_model.parameters(), self.args.max_grad_norm)
+            # if grad_norm is not finite, skip the update
+            if not torch.isfinite(grad_norm):
+                print(f"WARN: grad_norm is not finite: {grad_norm}")
+                self.optimizer.zero_grad()
+            else:
+                self.optimizer.step()
+                self.ema.update(step=self.global_step + 1)
 
-        # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: grad_norm is not finite: {grad_norm}")
-            self.optimizer.zero_grad()
-        else:
-            self.optimizer.step()
-
-        self.scheduler.step()
+            self.scheduler.step()
+            self.accumulated_grad_steps = 0
 
         # reduce loss across dp ranks
         lr = self.scheduler.get_last_lr()[0]
         loss_item = torch.tensor(loss_item, device=self.args.device)
         torch.distributed.all_reduce(loss_item, op=torch.distributed.ReduceOp.AVG)
-        return {
+        metrics = {
             "train/loss": loss_item.item(),
             "train/lr": lr,
-            "train/grad_norm": grad_norm.item(),
         }
+        if grad_norm is not None:
+            metrics["train/grad_norm"] = grad_norm.item()
 
-    def validation_step(self):
-        pass
+        return metrics
+
+    def validation_step(self, output_dir, step: int):
+        if self.eval_backend is not None:
+            checkpoint_type = "regular" if not self.ema.is_enabled() else "ema"
+            checkpoint_path = os.path.abspath(output_dir)
+            eval_output_dir = os.path.join(checkpoint_path, "eval")
+            self.eval_backend.submit_eval(checkpoint_path, step, eval_output_dir, checkpoint_type=checkpoint_type)
+
+    def _check_eval_results(self, rank: int, wait_until_complete: bool = False):
+        if self.eval_backend is None:
+            return
+        if wait_until_complete:
+            logger.info("Waiting for pending evaluation jobs to complete...")
+            while len(self.eval_backend.pending_evals) > 0:
+                for eval_step, metrics in self.eval_backend.check_and_get_completed():
+                    if rank == 0:
+                        metrics["global_step"] = eval_step
+                        self.tracking.log(metrics)
+                time.sleep(self.eval_backend.poll_interval)
+            logger.info("All evaluation jobs completed")
+        else:
+            for eval_step, metrics in self.eval_backend.check_and_get_completed():
+                if rank == 0:
+                    metrics["global_step"] = eval_step
+                    self.tracking.log(metrics)
 
     def train(self, resume_from_checkpoint: bool = False):
         self.prepare_model()
         train_dataloader = self.prepare_dataloader(self.train_dataset, is_training=True)
         self.train_dataloader = train_dataloader
-        if self.eval_dataset is not None:
-            raise NotImplementedError("Evaluation is not implemented")
         self.prepare_optimizer()
 
         # Validate config for IterableDataset and Dataset
         self.prepare_and_validate_config()
 
         warmup_steps = (
-            int(self.total_steps * self.args.warmup_ratio)
-            if self.args.warmup_ratio > 0
-            else self.args.warmup_steps
+            int(self.total_steps * self.args.warmup_ratio) if self.args.warmup_ratio > 0 else self.args.warmup_steps
         )
         self.prepare_scheduler(warmup_steps, self.total_steps)
         rank = dist.get_rank()
@@ -252,24 +355,29 @@ class FSDP2SFTTrainer:
         # Initialize tracking
         if rank == 0:
             self.tracking = Tracking(
-                project_name=os.environ.get("WANDB_PROJECT", "lmms-engine"),
-                experiment_name=self.args.run_name,
+                project_name=os.environ.get("WANDB_PROJECT", self.args.project),
+                experiment_name=os.environ.get("WANDB_NAME", self.args.run_name),
                 default_backend=self.default_backend,
                 config=self.args,
             )
 
         self.total_tokens = 0
+        self.compute_tracker = ComputeTracker(
+            num_gpus=world_size,
+            carbon_intensity=getattr(self.args, "carbon_intensity", 0.475) or 0.475,
+            gpu_tdp_watts=TrainUtilities.get_device_tdp(),
+            gpu_name=torch.cuda.get_device_name(),
+        )
+        self.compute_tracker.start()
+        loaded_checkpoint_dir: Optional[str] = None
         if resume_from_checkpoint:
             # Search for the latest checkpoint in the output_dir
-            checkpoints = [
-                f
-                for f in os.listdir(self.args.output_dir)
-                if f.startswith("checkpoint")
-            ]
+            checkpoints = [f for f in os.listdir(self.args.output_dir) if f.startswith("checkpoint")]
             checkpoints.sort(key=lambda x: int(x.split("-")[1]))
             latest_checkpoint = checkpoints[-1]
+            loaded_checkpoint_dir = os.path.join(self.args.output_dir, latest_checkpoint)
             self.load_checkpoints(
-                os.path.join(self.args.output_dir, latest_checkpoint),
+                loaded_checkpoint_dir,
                 int(latest_checkpoint.split("-")[1]),
             )
             start_epoch = int(latest_checkpoint.split("-")[1]) / self.steps_per_epoch
@@ -282,16 +390,27 @@ class FSDP2SFTTrainer:
             self.global_step = 0
             need_update_pbar = False
 
-        logger.info(
-            f"Training with {self.args.num_train_epochs} epochs with {self.total_steps} steps"
-        )
+        # Initialize EMA after model weights are loaded (and optionally restore from checkpoint).
+        self.ema.maybe_init(model=self.fsdp2_model, checkpoint_dir=loaded_checkpoint_dir)
+
+        logger.info(f"Training with {self.args.num_train_epochs} epochs with {self.total_steps} steps")
         self.step_profiler.start()
+        self.memory_snapshot_profiler.start()
 
         curr_epoch = start_epoch
 
-        pbar = tqdm(
-            total=self.total_steps, desc="Training", disable=dist.get_rank() != 0
-        )
+        # Step-0 evals on the initial weights (control points; fresh runs only).
+        # Val LOSS honors the HF-native trainer_args.eval_on_start; the benchmark
+        # has its own benchmark_eval.eval_on_start flag.
+        if self.eval_dataset is not None and getattr(self.args, "eval_on_start", False) and self.global_step == 0:
+            eval_metrics = self.evaluate()
+            if rank == 0 and eval_metrics:
+                eval_metrics["global_step"] = self.global_step
+                self.tracking.log(eval_metrics, step=self.global_step)
+        if self.benchmark_config is not None and self.benchmark_config.eval_on_start and self.global_step == 0:
+            self._run_benchmark_and_log(rank)
+
+        pbar = tqdm(total=self.total_steps, desc="Training", disable=dist.get_rank() != 0)
         while not self.should_stop():
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(curr_epoch)
@@ -307,9 +426,20 @@ class FSDP2SFTTrainer:
                 if self.should_stop():
                     break
                 # send batch to device
-                batch = send_to_device(batch, self.fsdp2_model.device)
+                with self.cuda_event_profiler.record("host_to_device", self.global_step):
+                    batch = send_to_device(batch, self.fsdp2_model.device, non_blocking=True)
+                self.memory_snapshot_profiler.step(self.global_step)
                 start_time = time.perf_counter()
-                train_metrics = self.training_step(batch)
+                try:
+                    with self.cuda_event_profiler.record("training_step", self.global_step):
+                        train_metrics = self.training_step(batch)
+                except torch.OutOfMemoryError:
+                    self.memory_snapshot_profiler.dump_on_exception(f"oom_step{self.global_step}")
+                    raise
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        self.memory_snapshot_profiler.dump_on_exception(f"oom_step{self.global_step}")
+                    raise
                 self.step_profiler.step()
                 if self.step_profiler.should_save(self.global_step + 1):
                     self.step_profiler.stop_and_save()
@@ -317,100 +447,258 @@ class FSDP2SFTTrainer:
                 end_time = time.perf_counter()
                 delta_time = end_time - start_time
 
-                # Calculate flops per rank
-                seq_len = (
-                    batch.get("attention_mask", torch.tensor(0))
-                    .sum(dim=1)
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                flops, promised_flops = model_utils.flops_counter.estimate_flops(
-                    seq_len, delta_time=delta_time
-                )
-                device = self.fsdp2_model.device
-                flops_tensor = torch.tensor(flops, device=device)
-                sp_size = pgm.process_group_manager.cp_world_size
+                with self.cuda_event_profiler.record("training_metrics", self.global_step):
+                    # Calculate flops per rank
+                    seq_len = batch.get("attention_mask", torch.zeros((1, 1))).sum(dim=1).detach().cpu().tolist()
+                    flops, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(
+                        seq_len, delta_time=delta_time
+                    )
+                    self.compute_tracker.accumulate_flops(raw_flops)
+                    device = self.fsdp2_model.device
+                    sp_size = pgm.process_group_manager.cp_world_size
+                    tp_size = pgm.process_group_manager.tp_world_size
+                    parallel_size = sp_size * tp_size
 
-                # Calculate mfu per rank
-                mfu = flops_tensor.item() / sp_size / promised_flops
-                mfu = torch.tensor(mfu, device=device)
-                torch.distributed.all_reduce(mfu, op=torch.distributed.ReduceOp.AVG)
-                mfu = mfu.item()
+                    # Calculate training metrics (MFU, token stats, throughput)
+                    perf_metrics, self.total_tokens = self.calculate_training_metrics(
+                        flops=flops,
+                        parallel_size=parallel_size,
+                        promised_flops=promised_flops,
+                        device=device,
+                        seq_len=seq_len,
+                        total_tokens=self.total_tokens,
+                        delta_time=delta_time,
+                        world_size=world_size,
+                    )
+                self.cuda_event_profiler.maybe_flush(self.global_step)
+                train_metrics.update(perf_metrics)
+                self.print_batch_input(batch)
 
-                # Calculating token stats
-                seq_len = torch.tensor(seq_len, device=device, dtype=torch.float32)
-                total_seq_len = seq_len.sum()
-                torch.distributed.all_reduce(
-                    total_seq_len, op=torch.distributed.ReduceOp.SUM
-                )
-                global_seq_len_avg = seq_len.sum()
-                torch.distributed.all_reduce(
-                    global_seq_len_avg, op=torch.distributed.ReduceOp.AVG
-                )
-                train_metrics["perf/global_seq_len_avg"] = global_seq_len_avg.item()
-                global_seq_len_min = seq_len.sum()
-                torch.distributed.all_reduce(
-                    global_seq_len_min, op=torch.distributed.ReduceOp.MIN
-                )
-                train_metrics["perf/global_seq_len_min"] = global_seq_len_min.item()
-                global_seq_len_max = seq_len.sum()
-                torch.distributed.all_reduce(
-                    global_seq_len_max, op=torch.distributed.ReduceOp.MAX
-                )
-                train_metrics["perf/global_seq_len_max"] = global_seq_len_max.item()
-
-                train_metrics["train/mfu"] = round(mfu, 2)
-                self.total_tokens += total_seq_len.item()
-
-                tokens_per_second = total_seq_len.item() / delta_time
-                tokens_per_gpu = tokens_per_second / sp_size / world_size
-
-                # Log total tokens and total tokens per second
-                train_metrics["train/total_tokens"] = TrainUtilities.format_tokens(
-                    self.total_tokens
-                )
-                train_metrics["train/tokens_per_second"] = round(tokens_per_second)
-                train_metrics["train/tokens_per_gpu"] = round(tokens_per_gpu)
+                is_accumulation_complete = self.accumulated_grad_steps == 0
 
                 if self.steps_per_epoch is not None and self.steps_per_epoch > 0:
                     epoch_progress = f"{self.global_step / self.steps_per_epoch:.2f}"
                     train_metrics["train/epoch"] = float(epoch_progress)
-                if rank == 0:
-                    self.tracking.log(train_metrics, step=self.global_step)
-                self.global_step += 1
-                if self.should_save:
-                    output_dir = os.path.join(
-                        self.args.output_dir, f"checkpoint-{self.global_step}"
-                    )
-                    self.save_checkpoints(
-                        output_dir,
-                        self.global_step,
-                        total_limit=self.args.save_total_limit,
-                    )
+                if is_accumulation_complete:
+                    if rank == 0:
+                        self.tracking.log(train_metrics, step=self.global_step)
+                    self.global_step += 1
+                    if self.should_save:
+                        output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
+                        self.save_checkpoints(
+                            output_dir,
+                            self.global_step,
+                            total_limit=self.args.save_total_limit,
+                        )
+                        self.validation_step(output_dir, self.global_step)
+                        # Token-weighted held-out val loss (ALL ranks call; rank 0 logs).
+                        if self.eval_dataset is not None:
+                            eval_metrics = self.evaluate()
+                            if rank == 0 and eval_metrics:
+                                eval_metrics["global_step"] = self.global_step
+                                self.tracking.log(eval_metrics, step=self.global_step)
 
-                if (
-                    self.args.torch_empty_cache_steps is not None
-                    and self.global_step % self.args.torch_empty_cache_steps == 0
-                ):
-                    self.empty_cache()
-                pbar.update(1)
+                    # In-loop benchmark eval on its own cadence (independent of save_steps).
+                    if self._should_benchmark():
+                        self._run_benchmark_and_log(rank)
+
+                    if (
+                        self.args.torch_empty_cache_steps is not None
+                        and self.global_step % self.args.torch_empty_cache_steps == 0
+                    ):
+                        self.empty_cache()
+                    pbar.update(1)
+                self._check_eval_results(rank)
             curr_epoch += 1
 
-            if self.eval_dataset is not None:
-                raise NotImplementedError("Evaluation is not implemented")
-
         pbar.close()
+        self.memory_snapshot_profiler.stop_and_save(reason="train_end")
         # Save the final checkpoint
-        output_dir = os.path.join(
-            self.args.output_dir, f"checkpoint-{self.global_step}"
-        )
-        self.save_checkpoints(
-            output_dir, self.global_step, total_limit=self.args.save_total_limit
-        )
+        output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
+        self.save_checkpoints(output_dir, self.global_step, total_limit=self.args.save_total_limit)
+        self.validation_step(output_dir, self.global_step)
+        if self.eval_dataset is not None:
+            final_eval = self.evaluate()
+            if rank == 0 and final_eval:
+                final_eval["global_step"] = self.global_step
+                self.tracking.log(final_eval, step=self.global_step)
+        # Final benchmark eval, unless the in-loop gate already ran at this step.
+        if self.benchmark_config is not None and self.global_step % self.benchmark_config.eval_steps != 0:
+            self._run_benchmark_and_log(rank)
+        # Wait for all pending eval jobs to complete
+        if self.eval_backend is not None:
+            self._check_eval_results(rank, wait_until_complete=True)
+
+        # Finalize compute tracking and save summary
+        if rank == 0:
+            summary = self.compute_tracker.finish()
+            self.compute_tracker.save_summary(self.args.output_dir, summary)
+            logger.info(
+                f"Compute Summary: Total FLOPS={summary.total_flops_formatted}, "
+                f"Duration={summary.training_duration_formatted}, "
+                f"Energy={summary.energy_kwh} kWh, CO2={summary.co2_formatted}"
+            )
+            self.tracking.log(
+                {
+                    "compute/total_flops": summary.total_flops,
+                    "compute/duration_seconds": summary.training_duration_seconds,
+                    "compute/energy_kwh": summary.energy_kwh,
+                    "compute/co2_kg": summary.co2_kg,
+                }
+            )
+        self.cuda_event_profiler.close()
 
     def evaluate(self):
-        raise NotImplementedError("Evaluation is not implemented")
+        """Token-weighted validation loss over the held-out eval_dataset.
+
+        ALL ranks must call this in lockstep: each FSDP forward triggers a collective
+        param all-gather, so we cannot eval on rank 0 only. The eval dataloader uses a
+        DistributedSampler with drop_last so every rank runs the same number of forward
+        steps. Loss is reduced as sum(per_token_loss) / sum(supervised_tokens) across all
+        ranks (token-weighted), matching the per-token-mean definition used in training.
+        """
+        if self.eval_dataset is None:
+            return {}
+        if getattr(self, "eval_dataloader", None) is None:
+            self.eval_dataloader = self.prepare_dataloader(self.eval_dataset, is_training=False)
+
+        was_training = self.fsdp2_model.training
+        self.fsdp2_model.eval()
+        device = self.fsdp2_model.device
+        sum_loss = torch.zeros((), device=device, dtype=torch.float32)
+        sum_tok = torch.zeros((), device=device, dtype=torch.float32)
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = send_to_device(batch, device, non_blocking=True)
+                loss = self.compute_loss(batch)  # mean CE over this batch's supervised tokens
+                n_tok = (batch["labels"] != -100).sum().to(torch.float32)
+                sum_loss += loss.float() * n_tok
+                sum_tok += n_tok
+        torch.distributed.all_reduce(sum_loss, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(sum_tok, op=torch.distributed.ReduceOp.SUM)
+        val_loss = (sum_loss / sum_tok.clamp(min=1.0)).item()
+        if was_training:
+            self.fsdp2_model.train()
+        return {"eval/loss": val_loss}
+
+    def _should_benchmark(self) -> bool:
+        return (
+            self.benchmark_config is not None
+            and self.global_step > 0
+            and self.global_step % self.benchmark_config.eval_steps == 0
+        )
+
+    def _prepare_benchmark(self):
+        cfg = self.benchmark_config
+        hf_processor = getattr(self.processing_class, "processor", self.processing_class)
+        dataset = BenchmarkDataset(cfg, hf_processor)
+        # drop_last=False pads by repeating samples -> every rank runs the same
+        # number of generate() calls (FSDP collectives stay lockstep); repeats
+        # are deduped by row idx during aggregation.
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=pgm.process_group_manager.dp_world_size,
+            rank=pgm.process_group_manager.dp_rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        self.benchmark_dataloader = DataLoader(
+            dataset,
+            batch_size=cfg.per_device_batch_size,
+            sampler=sampler,
+            collate_fn=GenerationCollator(hf_processor),
+            num_workers=cfg.num_workers,
+            drop_last=False,
+        )
+        self.benchmark_reward_fn = load_reward_fn(cfg.reward_fn_path, cfg.reward_fn_name)
+        self._benchmark_tokenizer = hf_processor.tokenizer
+
+    def benchmark_evaluate(self):
+        """Generation benchmark eval (verl ``_validate`` style).
+
+        Every rank generates its shard with the ORIGINAL HF forwards (the rmpad
+        training patches break the kv-cache decode path; ``generation_context``
+        restores them afterwards), scores generations with the rule reward fn,
+        then results are gathered to rank 0 for aggregation/logging.
+        """
+        cfg = self.benchmark_config
+        if cfg is None:
+            return {}
+        if pgm.process_group_manager.cp_world_size > 1 or pgm.process_group_manager.tp_world_size > 1:
+            logger.warning("benchmark_eval supports pure DP only (sp/tp degree 1); skipping")
+            return {}
+        if self.args.use_rmpad and not MONKEY_PATCHER.has_stash:
+            # Only patch fns that call stash_original (currently qwen3_vl) can be
+            # reverted for generation; rmpad forwards without a stash would crash
+            # in the kv-cache decode path or return garbage.
+            logger.warning(
+                "benchmark_eval: rmpad patches are active but no original forwards were stashed "
+                "(this model family's monkey patch lacks stash_original); skipping benchmark eval"
+            )
+            return {}
+        if self.benchmark_dataloader is None:
+            self._prepare_benchmark()
+
+        was_training = self.fsdp2_model.training
+        self.fsdp2_model.eval()
+        self.empty_cache()
+        device = self.fsdp2_model.device
+        tokenizer = self._benchmark_tokenizer
+        results = []
+        start_time = time.perf_counter()
+        with torch.no_grad(), MONKEY_PATCHER.generation_context():
+            for batch in self.benchmark_dataloader:
+                model_inputs = send_to_device(dict(batch["model_inputs"]), device)
+                input_len = model_inputs["input_ids"].shape[1]
+                max_new = max(cfg.max_total_len - input_len, 1)
+                if cfg.max_new_tokens is not None:
+                    max_new = min(max_new, cfg.max_new_tokens)
+                out = self.fsdp2_model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new,
+                    do_sample=cfg.do_sample,
+                    use_cache=True,
+                    # REQUIRED: HF does not auto-detect fully_shard (FSDP2); without
+                    # this, ranks finishing early stop forwarding and the remaining
+                    # ranks deadlock on the FSDP all-gather collectives.
+                    synced_gpus=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                # Left padding -> prompts end at a uniform offset.
+                generations = tokenizer.batch_decode(out[:, input_len:], skip_special_tokens=True)
+                for meta, generation in zip(batch["meta"], generations):
+                    results.append(score_generation(self.benchmark_reward_fn, meta, generation))
+
+        rank = dist.get_rank()
+        gathered = [None] * dist.get_world_size() if rank == 0 else None
+        dist.gather_object(results, gathered, dst=0)
+        if was_training:
+            self.fsdp2_model.train()
+        self.empty_cache()
+        if rank != 0:
+            return {}
+        flat = [r for rs in gathered for r in rs]
+        metrics = aggregate_benchmark_results(flat)
+        metrics["eval/bench/eval_time_s"] = round(time.perf_counter() - start_time, 1)
+        self._dump_benchmark_samples(flat)
+        return metrics
+
+    def _dump_benchmark_samples(self, results):
+        """Dump the first log_samples generations for inspection (rank 0 only)."""
+        dump_dir = os.path.join(self.args.output_dir, "bench_eval")
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"step{self.global_step}.jsonl")
+        rows = sorted(dedupe_by_idx(results), key=lambda r: r["idx"])[: self.benchmark_config.log_samples]
+        with open(path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info(f"Dumped {len(rows)} benchmark generations to {path}")
+
+    def _run_benchmark_and_log(self, rank: int):
+        bench_metrics = self.benchmark_evaluate()
+        if rank == 0 and bench_metrics:
+            bench_metrics["global_step"] = self.global_step
+            self.tracking.log(bench_metrics, step=self.global_step)
 
     def remove_old_checkpoints(self, output_path: str, total_limit: int = None):
         if total_limit is None:
@@ -426,8 +714,7 @@ class FSDP2SFTTrainer:
     def save_checkpoints(self, output_path: str, step: int, total_limit: int = None):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        if rank == 0:
-            os.makedirs(output_path, exist_ok=True)
+        os.makedirs(output_path, exist_ok=True)
 
         dist.barrier()
         model_path = os.path.join(
@@ -450,22 +737,31 @@ class FSDP2SFTTrainer:
             "dataloader_state",
             f"dataloader_state_world_size_{world_size}_rank_{rank}.pt",
         )
-        if rank == 0:
-            os.makedirs(
-                os.path.join(output_path, "pytorch_model_fsdp_0"), exist_ok=True
-            )
-            os.makedirs(os.path.join(output_path, "optimizer"), exist_ok=True)
-            os.makedirs(os.path.join(output_path, "extra_state"), exist_ok=True)
-            os.makedirs(os.path.join(output_path, "dataloader_state"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "pytorch_model_fsdp_0"), exist_ok=True)
+        ema_enabled = self.ema.is_enabled()
+        if ema_enabled:
+            os.makedirs(os.path.join(output_path, "pytorch_ema_model_fsdp_0"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "optimizer"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "extra_state"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "dataloader_state"), exist_ok=True)
 
         dist.barrier()
 
         torch.save(self.fsdp2_model.state_dict(), model_path)
+        if ema_enabled and self.ema.initialized:
+            ema_model_path = os.path.join(
+                output_path,
+                "pytorch_ema_model_fsdp_0",
+                f"model_world_size_{world_size}_rank_{rank}.pt",
+            )
+            torch.save(self.ema.state_dict_for_save(self.fsdp2_model), ema_model_path)
         torch.save(self.optimizer.state_dict(), optim_path)
         extra_state = {
             "lr_scheduler_state": self.scheduler.state_dict(),
             "rng": self.get_rng_state(),
             "total_tokens": self.total_tokens,
+            "accumulated_grad_steps": self.accumulated_grad_steps,
+            "compute_tracker": self.compute_tracker.state_dict(),
         }
         torch.save(extra_state, extra_state_path)
         torch.save(self.train_dataloader.state_dict(), dataloader_state_path)
@@ -474,9 +770,7 @@ class FSDP2SFTTrainer:
         if rank == 0:
             self.processing_class.save_pretrained(output_path)
             self.model.config.save_pretrained(output_path)
-            self.remove_old_checkpoints(
-                self.args.output_dir, total_limit=self.args.save_total_limit
-            )
+            self.remove_old_checkpoints(self.args.output_dir, total_limit=self.args.save_total_limit)
 
         dist.barrier()
 
@@ -513,11 +807,12 @@ class FSDP2SFTTrainer:
         self.optimizer.load_state_dict(torch.load(optim_path, weights_only=False))
         extra_state = torch.load(extra_state_path, weights_only=False)
         self.total_tokens = extra_state["total_tokens"]
+        self.accumulated_grad_steps = extra_state.get("accumulated_grad_steps", 0)
+        if "compute_tracker" in extra_state and hasattr(self, "compute_tracker"):
+            self.compute_tracker.load_state_dict(extra_state["compute_tracker"])
         self.load_rng_state(extra_state["rng"])
         self.scheduler.load_state_dict(extra_state["lr_scheduler_state"])
-        self.train_dataloader.load_state_dict(
-            torch.load(dataloader_state_path, weights_only=False)
-        )
+        self.train_dataloader.load_state_dict(torch.load(dataloader_state_path, weights_only=False))
         logger.info(f"Loaded checkpoint from {output_path} at step {step}")
 
     def get_rng_state(self):
@@ -541,11 +836,11 @@ class FSDP2SFTTrainer:
             self.steps_per_epoch = self.args.max_steps
             self.total_steps = self.args.max_steps
         else:
-            self.steps_per_epoch = len(self.train_dataloader)
+            self.steps_per_epoch = (
+                len(self.train_dataloader) + self.args.gradient_accumulation_steps - 1
+            ) // self.args.gradient_accumulation_steps
             self.total_steps = (
-                self.steps_per_epoch * self.args.num_train_epochs
-                if self.args.max_steps < 0
-                else self.args.max_steps
+                self.steps_per_epoch * self.args.num_train_epochs if self.args.max_steps < 0 else self.args.max_steps
             )
 
     def should_stop(self):
@@ -561,3 +856,84 @@ class FSDP2SFTTrainer:
     def empty_cache(self):
         gc.collect()
         torch.cuda.empty_cache()
+
+    def print_batch_input(self, batch):
+        if self.args.print_batch_input_steps > 0 and self.global_step % self.args.print_batch_input_steps == 0:
+            try:
+                input_ids = batch.get("input_ids", torch.tensor(0))
+                logger.info(self.processing_class.processor.batch_decode(input_ids, skip_special_tokens=True)[0])
+            except Exception as e:
+                logger.error(f"Error printing batch input: {e}")
+
+    @staticmethod
+    def calculate_training_metrics(
+        flops: float,
+        parallel_size: int,
+        promised_flops: float,
+        device: torch.device,
+        seq_len: list,
+        total_tokens: int,
+        delta_time: float,
+        world_size: int,
+    ) -> tuple[dict, int]:
+        """
+        Calculate training performance metrics including MFU, token statistics, and throughput.
+
+        Uses a single ``all_gather`` over a 2-element per-rank tensor
+        ``[mfu_local, seq_len_sum_local]`` and reduces (mean/sum/min/max)
+        locally, replacing five independent ``all_reduce`` calls.
+
+        Args:
+            flops: Per-rank FLOPs count (Python float from ``estimate_flops``).
+            parallel_size: Product of sequence and tensor parallel sizes.
+            promised_flops: Promised FLOPs capacity.
+            device: Device to perform computations on.
+            seq_len: List of sequence lengths per batch (one entry per local sample).
+            total_tokens: Current total token count.
+            delta_time: Time taken for the training step.
+            world_size: Distributed training world size.
+
+        Returns:
+            tuple: (metrics_dict, updated_total_tokens)
+        """
+        # Divide mfu by parallel size because seq_len/flops are estimated
+        # before SP/TP sharding. seq_len comes in as a plain Python list so we
+        # avoid an extra GPU sync and just sum it on the host.
+        mfu_local = flops / parallel_size / promised_flops
+        seq_len_sum_local = float(sum(seq_len))
+
+        local = torch.tensor([mfu_local, seq_len_sum_local], device=device, dtype=torch.float32)
+        gathered = torch.empty(world_size * 2, device=device, dtype=torch.float32)
+        torch.distributed.all_gather_into_tensor(gathered, local)
+        gathered = gathered.view(world_size, 2)
+
+        mfu_all = gathered[:, 0]
+        sl_all = gathered[:, 1]
+
+        # Reduce on-device, then do a single batched .tolist() sync to pull
+        # all five scalars at once.
+        reduced = torch.stack(
+            [
+                mfu_all.mean(),
+                sl_all.sum() / parallel_size,  # total_seq_len (deduped across SP/TP)
+                sl_all.mean(),  # global_seq_len_avg
+                sl_all.amin(),  # global_seq_len_min
+                sl_all.amax(),  # global_seq_len_max
+            ]
+        ).tolist()
+        mfu, total_seq_len, global_seq_len_avg, global_seq_len_min, global_seq_len_max = reduced
+
+        total_tokens += total_seq_len
+        tokens_per_second = total_seq_len / delta_time
+        tokens_per_gpu = tokens_per_second / world_size
+
+        metrics = {
+            "train/mfu": round(mfu, 2),
+            "perf/global_seq_len_avg": global_seq_len_avg,
+            "perf/global_seq_len_min": global_seq_len_min,
+            "perf/global_seq_len_max": global_seq_len_max,
+            "train/total_tokens": TrainUtilities.format_tokens(total_tokens),
+            "train/tokens_per_second": round(tokens_per_second),
+            "train/tokens_per_gpu": round(tokens_per_gpu),
+        }
+        return metrics, total_tokens

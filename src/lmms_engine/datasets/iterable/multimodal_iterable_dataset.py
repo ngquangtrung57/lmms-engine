@@ -1,6 +1,7 @@
 import math
 import os
 import random
+import traceback
 from copy import deepcopy
 
 import torch.distributed as dist
@@ -9,6 +10,7 @@ from datasets import load_dataset, load_from_disk
 from loguru import logger
 from torch.utils.data import get_worker_info
 
+import lmms_engine.parallel.process_group_manager as pgm
 from lmms_engine.datasets.multimodal_mixin import MultiModalDataLoadingMixin
 from lmms_engine.utils import DataUtilities
 
@@ -26,6 +28,7 @@ except ImportError:
     logger.info("Azure SDK not installed. Skipping import.")
 
 from lmms_engine.datasets.iterable.base_iterable_dataset import BaseIterableDataset
+from lmms_engine.datasets.packing import build_online_packer
 
 
 class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin):
@@ -45,23 +48,28 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             self.storage_client = Client()
             self.bucket_name = self.config.bucket_name
         elif self.config.object_storage == "azure":
-            self.storage_client = BlobServiceClient(
-                account_url=SAS_URL, retry_policy=RETRY_POLICY
-            )
+            self.storage_client = BlobServiceClient(account_url=SAS_URL, retry_policy=RETRY_POLICY)
             self.bucket_name = self.config.bucket_name
         self.cur_idx = 0
+        # Set to True by load_state_dict; consumed (and cleared) by __iter__ so
+        # that the next iteration pass continues from the saved cur_idx instead
+        # of being reset to 0.
+        self._resuming = False
         if not dist.is_initialized():
-            logger.info(
-                "Distributed environment not initialized, setting rank and world size to 0 and 1"
-            )
+            logger.info("Distributed environment not initialized, setting rank and world size to 0 and 1")
             self.rank = 0
             self.world_size = 1
         else:
             logger.info(
                 "Distributed environment initialized, setting rank and world size to dist.get_rank() and dist.get_world_size()"
             )
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
+            # Try to use data parallel rank if available, otherwise fall back to global rank
+            if pgm is not None and hasattr(pgm, "process_group_manager") and pgm.process_group_manager is not None:
+                self.rank = pgm.process_group_manager.dp_rank
+                self.world_size = pgm.process_group_manager.dp_world_size
+            else:
+                self.rank = dist.get_rank()
+                self.world_size = dist.get_world_size()
 
     def _build_from_config(self):
         """Load and prepare data from the configuration."""
@@ -81,24 +89,20 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             # Handle both external YAML files and inline datasets
             if self.config.datasets is not None:
                 # Use inline datasets defined in the config
-                self.data_list, self.data_folder = DataUtilities.load_inline_datasets(
-                    self.config.datasets
-                )
+                self.data_list, self.data_folder = DataUtilities.load_inline_datasets(self.config.datasets)
             elif self.config.dataset_path is not None:
                 # Load from external YAML file
-                self.data_list, self.data_folder = DataUtilities.load_yaml(
-                    self.config.dataset_path
-                )
+                self.data_list, self.data_folder = DataUtilities.load_yaml(self.config.dataset_path)
             else:
-                raise ValueError(
-                    "For yaml format, either 'datasets' or 'dataset_path' must be provided"
-                )
+                raise ValueError("For yaml format, either 'datasets' or 'dataset_path' must be provided")
         else:
             raise NotImplementedError
 
         if self.config.shuffle:
             logger.info("Shuffle Dataset ...")
             data_index = [i for i in range(len(self.data_list))]
+            # Make sure the shuffle is the same across all dp ranks
+            random.seed(self.config.data_seed)
             random.shuffle(data_index)
             if isinstance(self.data_list, HFDataset):
                 self.data_list = self.data_list.select(data_index)
@@ -132,18 +136,14 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
         rank = self.rank
         world_size = self.world_size
 
-        assert isinstance(
-            self.data_list, HFDataset
-        ), "Data list must be a HuggingFace dataset for IterableDataset"
+        assert isinstance(self.data_list, HFDataset), "Data list must be a HuggingFace dataset for IterableDataset"
 
         # HF shard logic, if len(dataset) % n == l
         # The first l ranks will have dataset length (len(dataset) // n) + 1
         # The rest ranks will have dataset length (len(dataset) // n)
         rank_mod_size = len(self.data_list) % world_size
         per_rank_size = [
-            (len(self.data_list) // world_size) + 1
-            if i < rank_mod_size
-            else (len(self.data_list) // world_size)
+            (len(self.data_list) // world_size) + 1 if i < rank_mod_size else (len(self.data_list) // world_size)
             for i in range(world_size)
         ]
         start_index = sum(per_rank_size[:rank])
@@ -152,21 +152,24 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
         # Shard the data according to distributed environment
         curr_data_folder = self.data_folder[start_index:end_index]
         # self.data_folder = self.data_folder[start_index:end_index]
-        curr_data_list = self.data_list.shard(
-            num_shards=world_size, index=rank, contiguous=True
-        )
+        curr_data_list = self.data_list.shard(num_shards=world_size, index=rank, contiguous=True)
 
         if worker_info is None:
             iter_start = 0
             iter_end = len(curr_data_list)
         else:
             # split workload
-            per_worker = int(
-                math.ceil(len(curr_data_list) / float(worker_info.num_workers))
-            )
+            per_worker = int(math.ceil(len(curr_data_list) / float(worker_info.num_workers)))
             worker_id = worker_info.id
             iter_start = worker_id * per_worker
             iter_end = min(iter_start + per_worker, len(curr_data_list))
+
+        if iter_start >= iter_end:
+            # More workers than rows in this rank's shard (tiny datasets / many
+            # ranks): this worker has nothing to serve. HF .select() rejects
+            # start == len even for an empty range, so return an empty iterator
+            # instead of crashing the whole run.
+            return
 
         # Distrbute the data to each worker
         curr_data_list = curr_data_list.select(range(iter_start, iter_end))
@@ -174,61 +177,91 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             curr_data_folder = curr_data_folder[iter_start:iter_end]
 
         if self.config.packing:
-            # Reset index at the start of each iteration pass
-            self.cur_idx = 0
-            buffer = []
-            buffer_length = 0
+            # Reset index only when starting a fresh pass. When resuming from a
+            # checkpoint via StatefulDataLoader, load_state_dict() has set
+            # self.cur_idx and self._resuming=True, so we keep cur_idx as-is.
+            if not self._resuming:
+                self.cur_idx = 0
+            self._resuming = False
             packing_length = self.config.packing_length
+            packing_kwargs = self.config.extra_kwargs.get("packing_kwargs", {})
+            packer = build_online_packer(
+                self.config.packing_strategy or "first_fit",
+                packing_length,
+                **packing_kwargs,
+            )
 
             # Iterate through the dataset once per epoch
+            n_ok = 0
+            n_err = 0
             while self.cur_idx < len(curr_data_list):
                 try:
-                    data_dict = self.get_one_sample(
-                        self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list
-                    )
+                    data_dict = self.get_one_sample(self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list)
+                    n_ok += 1
                 except Exception as e:
+                    n_err += 1
+                    # Fail fast when the WHOLE shard is broken (e.g. data folder
+                    # missing on this node): skip-and-continue would otherwise
+                    # rescan forever, spam multi-GB logs, and wedge the other
+                    # ranks in their collectives while this rank yields nothing.
+                    if n_err >= 100 and n_ok == 0:
+                        raise RuntimeError(
+                            f"first {n_err} samples of this shard ALL failed (last: {e}); "
+                            "data folder unreadable/missing on this node?"
+                        ) from e
+                    traceback.print_exc()
                     logger.error(f"Error getting one sample: {e}, skip this sample")
                     self.cur_idx += 1
                     continue
-                input_ids = data_dict["input_ids"]
-                data_length = input_ids.shape[0]
+                data_length = data_dict["input_ids"].shape[0]
                 self.cur_idx += 1
 
                 # Drop overlong sample if filtering is enabled
                 if data_length > packing_length and self.config.filter_overlong:
                     continue
 
-                # If current sample cannot fit into current buffer, yield the buffer first
-                if buffer_length > 0 and buffer_length + data_length > packing_length:
-                    yield buffer
-                    buffer = []
-                    buffer_length = 0
-
-                # If the sample is still longer than packing_length (and not filtered),
-                # yield it as its own batch to avoid stalling
+                # Oversized samples bypass the packer: flush whatever is buffered
+                # first (to preserve ordering) and yield the sample on its own.
                 if data_length > packing_length:
+                    yield from packer.flush()
                     yield [data_dict]
                     continue
 
-                # Append to buffer
-                buffer.append(data_dict)
-                buffer_length += data_length
+                yield from packer.add(data_dict, data_length)
 
             # Flush remaining buffer
-            if len(buffer) > 0:
-                yield buffer
+            yield from packer.flush()
         else:
-            self.cur_idx = 0
+            if not self._resuming:
+                self.cur_idx = 0
+            self._resuming = False
             while self.cur_idx < len(curr_data_list):
                 try:
-                    yield self.get_one_sample(
-                        self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list
-                    )
+                    yield self.get_one_sample(self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list)
                 except Exception as e:
+                    traceback.print_exc()
                     logger.error(f"Error getting one sample: {e}, skip this sample")
                     self.cur_idx += 1
                     continue
                 self.cur_idx += 1
+
+    def state_dict(self):
+        """Stateful protocol for torchdata.StatefulDataLoader.
+
+        Called by StatefulDataLoader inside each worker process. We only need
+        to persist the per-worker iteration cursor; rank/worker sharding is
+        deterministic given the data_seed + world_size + num_workers.
+        """
+        return {"cur_idx": self.cur_idx}
+
+    def load_state_dict(self, state_dict):
+        """Restore the per-worker iteration cursor saved by state_dict().
+
+        Sets ``_resuming=True`` so that the next ``__iter__`` pass does NOT
+        reset ``cur_idx`` to 0 and instead continues from the restored position.
+        """
+        self.cur_idx = int(state_dict.get("cur_idx", 0))
+        self._resuming = True
 
     def load_from_json(self, data, data_folder=None):
         """

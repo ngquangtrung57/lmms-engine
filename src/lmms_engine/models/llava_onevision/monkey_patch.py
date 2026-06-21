@@ -1,5 +1,7 @@
 from functools import wraps
 
+import torch
+import torch.nn as nn
 import transformers
 from packaging import version
 from transformers import PreTrainedModel
@@ -52,3 +54,56 @@ def apply_liger_kernel_to_llava_onevision(
         model=model.language_model,
         use_rmpad=use_rmpad,
     )
+
+
+@MONKEY_PATCHER.register("llava_onevision", "video")
+def apply_video_extensions_to_llava_onevision(
+    model: PreTrainedModel = None,
+    faster_token_stride: int = 10,
+    mm_spatial_pool_stride: int = 2,
+    mm_spatial_pool_mode: str = "bilinear",
+):
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionModel,
+    )
+
+    if transformer_version < version.parse(SUPPORTED_TRANSFORMER_VERSION):
+        logger.warning(TRANSFORMER_DEPRECATION_WARNING)
+
+    # Store slow-fast parameters in model.config so forward can access them
+    model.config.faster_token_stride = faster_token_stride
+    model.config.mm_spatial_pool_stride = mm_spatial_pool_stride
+    model.config.mm_spatial_pool_mode = mm_spatial_pool_mode
+
+    # Initialize faster_token parameter for slow-fast frame processing
+    # Applying video patch automatically enables slow-fast
+    _initialize_faster_token(model)
+    logger.info(f"Enabled slow-fast frame processing with stride={faster_token_stride}")
+
+    # Apply custom forward for video processing
+    # This forward supports both standard pooling and slow-fast frame modes
+    from .llava_video_forward import forward as llava_video_model_forward
+
+    LlavaOnevisionModel.forward = llava_video_model_forward
+    logger.info(
+        f"Applied video-aware forward to LlavaOnevisionModel "
+        f"(pooling mode: {mm_spatial_pool_mode}, stride: {mm_spatial_pool_stride})"
+    )
+
+    logger.info("Successfully applied video extensions to LLaVA-OneVision model")
+
+
+def _initialize_faster_token(model: PreTrainedModel):
+    if hasattr(model.model, "faster_token"):
+        logger.info("faster_token already initialized, skipping")
+        return
+
+    hidden_size = model.config.text_config.hidden_size
+    dtype = model.dtype
+
+    # Initialize faster_token with small random values
+    embed_std = 1 / torch.sqrt(torch.tensor(hidden_size, dtype=torch.float32))
+    faster_token = nn.Parameter(torch.randn(hidden_size, dtype=dtype) * embed_std)
+
+    model.model.faster_token = faster_token
+    logger.info(f"Initialized faster_token parameter with shape {faster_token.shape}")

@@ -17,9 +17,7 @@ def pad_without_fast_tokenizer_warning(tokenizer, *pad_args, **pad_kwargs):
         return tokenizer.pad(*pad_args, **pad_kwargs)
 
     # Save the state of the warning, then disable it
-    warning_state = tokenizer.deprecation_warnings.get(
-        "Asking-to-pad-a-fast-tokenizer", False
-    )
+    warning_state = tokenizer.deprecation_warnings.get("Asking-to-pad-a-fast-tokenizer", False)
     tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
     try:
@@ -42,9 +40,7 @@ def _torch_collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] 
     # Check if padding is necessary.
 
     are_tensors_same_length = all(x.size(0) == length_of_first for x in examples)
-    if are_tensors_same_length and (
-        pad_to_multiple_of is None or length_of_first % pad_to_multiple_of == 0
-    ):
+    if are_tensors_same_length and (pad_to_multiple_of is None or length_of_first % pad_to_multiple_of == 0):
         if not isinstance(examples, torch.Tensor):
             return torch.stack(examples, dim=0)
 
@@ -83,9 +79,7 @@ class TextDllmCollator(DataCollatorForLanguageModeling):
         assert 0.0 <= self.p_min <= self.p_max <= 1.0
         assert return_tensors == "pt", "This collator currently supports PyTorch only."
 
-    def __call__(
-        self, examples: List[Union[List[int], Dict[str, torch.Tensor]]]
-    ) -> Dict[str, torch.Tensor]:
+    def __call__(self, examples: List[Union[List[int], Dict[str, torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         if self.seed and self.generator is None:
             self.create_rng()
 
@@ -98,9 +92,7 @@ class TextDllmCollator(DataCollatorForLanguageModeling):
             )
         else:
             batch = {
-                "input_ids": _torch_collate_batch(
-                    examples, self.tokenizer, pad_to_multiple_of=self.pad_to_multiple_of
-                )
+                "input_ids": _torch_collate_batch(examples, self.tokenizer, pad_to_multiple_of=self.pad_to_multiple_of)
             }
         special_tokens_mask = batch.pop("special_tokens_mask", None)
         batch["input_ids"], batch["labels"], batch["mlm_prob"] = self.torch_mask_tokens(
@@ -108,38 +100,27 @@ class TextDllmCollator(DataCollatorForLanguageModeling):
         )
         return batch
 
-    def torch_mask_tokens(
-        self, inputs: Any, special_tokens_mask: Optional[Any] = None
-    ) -> tuple[Any, Any]:
+    def torch_mask_tokens(self, inputs: Any, special_tokens_mask: Optional[Any] = None) -> tuple[Any, Any]:
         labels = inputs.clone()
         # We sample a few tokens uniformly in each sequence for MLM training
         B = labels.shape[0]
         mlm_probabilities = (
-            torch.rand(B, generator=self.generator, device=labels.device)
-            * (self.p_max - self.p_min)
-            + self.p_min
+            torch.rand(B, generator=self.generator, device=labels.device) * (self.p_max - self.p_min) + self.p_min
         )
-        probability_matrix = mlm_probabilities.view(
-            B, *([1] * (labels.ndim - 1))
-        ) * torch.ones_like(labels, device=labels.device)
+        probability_matrix = mlm_probabilities.view(B, *([1] * (labels.ndim - 1))) * torch.ones_like(
+            labels, device=labels.device
+        )
 
         if special_tokens_mask is None:
             special_tokens_mask = [
-                self.tokenizer.get_special_tokens_mask(
-                    val, already_has_special_tokens=True
-                )
-                for val in labels.tolist()
+                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
             ]
             special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
         else:
             special_tokens_mask = special_tokens_mask.bool()
 
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-        masked_indices = torch.bernoulli(
-            probability_matrix, generator=self.generator
-        ).bool()
+        masked_indices = torch.bernoulli(probability_matrix, generator=self.generator).bool()
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
-        inputs[masked_indices] = self.tokenizer.convert_tokens_to_ids(
-            self.tokenizer.mask_token
-        )
+        inputs[masked_indices] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
         return inputs, labels, mlm_probabilities

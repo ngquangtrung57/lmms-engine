@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 from PIL import Image
 
-from lmms_engine.datasets.collator import VisionCollator
+from lmms_engine.datasets.collator import LLaVACollator, VisionCollator
 from lmms_engine.datasets.naive.multimodal_dataset import MultiModalDataset
 from lmms_engine.mapping_func import register_dataset
 from lmms_engine.utils.train_utils import TrainUtilities
@@ -46,18 +46,14 @@ class VisionSFTDataset(MultiModalDataset):
 
         hf_messages = TrainUtilities.convert_open_to_hf(messages)
         if data_folder is not None:
-            images = [
-                Image.open(os.path.join(data_folder, image)) for image in images_list
-            ]
+            images = [Image.open(os.path.join(data_folder, image)) for image in images_list]
         else:
             images = [Image.open(image) for image in images_list]
         if len(images) == 0:
             images = None
         if len(videos) == 0:
             videos = None
-        inputs = self.processor.process(
-            images=images, hf_messages=hf_messages, videos=videos, **kwargs
-        )
+        inputs = self.processor.process(images=images, hf_messages=hf_messages, videos=videos, **kwargs)
         return inputs
 
     def load_from_json(self, data, data_folder=None) -> Dict[str, torch.Tensor]:
@@ -83,18 +79,14 @@ class VisionSFTDataset(MultiModalDataset):
 
         hf_messages = TrainUtilities.convert_open_to_hf(messages)
         if data_folder is not None:
-            images = [
-                Image.open(os.path.join(data_folder, image)) for image in images_list
-            ]
+            images = [Image.open(os.path.join(data_folder, image)) for image in images_list]
         else:
             images = [Image.open(image) for image in images_list]
         if len(images) == 0:
             images = None
         if len(videos) == 0:
             videos = None
-        inputs = self.processor.process(
-            images=images, hf_messages=hf_messages, videos=videos, **kwargs
-        )
+        inputs = self.processor.process(images=images, hf_messages=hf_messages, videos=videos, **kwargs)
         return inputs
 
     def load_from_hf(self, data) -> Dict[str, torch.Tensor]:
@@ -108,4 +100,7 @@ class VisionSFTDataset(MultiModalDataset):
         return inputs
 
     def get_collator(self):
-        return VisionCollator(self.processor)
+        if self.processor_config.processor_type == "llava":
+            return LLaVACollator(self.processor)
+        else:
+            return VisionCollator(self.processor)

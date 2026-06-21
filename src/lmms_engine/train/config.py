@@ -13,11 +13,51 @@ class TrainingArguments(transformers.TrainingArguments):
     freeze_modules: Optional[List[str]] = None
     use_rmpad: Optional[bool] = False
     fsdp2: Optional[bool] = False
-    sp_ulysses_degree: Optional[int] = 1
     reduce_dtype: Optional[str] = "bfloat16"
     output_dtype: Optional[str] = "bfloat16"
+    print_batch_input_steps: Optional[int] = -1
     enable_profiler: Optional[bool] = False
     profiler_config: Optional[Dict[str, Any]] = None
+    # CUDA memory snapshot profiler (separate from StepProfiler).
+    # When enabled, records every alloc/free event with Python stack traces
+    # and auto-dumps a .pickle on CUDA OOM. View at https://pytorch.org/memory_viz
+    enable_memory_snapshot: Optional[bool] = False
+    memory_snapshot_config: Optional[Dict[str, Any]] = None
+    enable_cuda_event_profiler: Optional[bool] = False
+    cuda_event_profiler_config: Optional[Dict[str, Any]] = None
+
+    # Parallelism
+    ep_degree: Optional[int] = 1
+    sp_ulysses_degree: Optional[int] = 1
+    tp_degree: Optional[int] = 1
+
+    # --- EMA (Exponential Moving Average) ---
+    ema_enabled: Optional[bool] = False
+    ema_decay: Optional[float] = 0.9999
+    ema_update_every: Optional[int] = 1
+    ema_start_step: Optional[int] = 0
+    ema_requires_grad_only: Optional[bool] = True
+    # Optional name-based filtering for which parameters participate in EMA.
+    # Example:
+    #   ema_param_filter:
+    #     mode: "substring"  # or "regex"
+    #     include: ["language_model"]   # only include matching params
+    #     exclude: ["lm_head"]          # exclude matching params
+    ema_param_filter: Optional[Dict[str, Any]] = None
+    ema_resume_from_ema: Optional[bool] = False
+
+    # --- Eval Server Configuration ---
+    eval_config: Optional[Dict[str, Any]] = None
+
+    # --- In-loop benchmark eval (generate + rule scoring on a verl-format parquet;
+    # keys -> lmms_engine.eval.benchmark.BenchmarkEvalConfig) ---
+    benchmark_eval: Optional[Dict[str, Any]] = None
+
+    # --- Compute / CO2 Tracking ---
+    carbon_intensity: Optional[float] = 0.475  # kgCO2/kWh, global average
+
+    # --- backward compatibility ---
+    group_by_length: Optional[bool] = False
 
 
 @dataclass

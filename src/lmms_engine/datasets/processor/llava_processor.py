@@ -8,6 +8,7 @@ from transformers.models.llava_onevision.processing_llava_onevision import (
 )
 
 from lmms_engine.mapping_func import register_processor
+from lmms_engine.utils import DataUtilities
 
 from .config import ProcessorConfig
 
@@ -19,6 +20,12 @@ class LLaVADataProcessor:
 
     def build(self):
         self.processor = self._build_processor()
+
+    @property
+    def special_tokens(self):
+        if not hasattr(self, "_special_tokens"):
+            self._special_tokens = DataUtilities.get_special_tokens(self.processor.tokenizer)
+        return self._special_tokens
 
     def _build_processor(self):
         processor = LlavaOnevisionProcessor.from_pretrained(self.config.processor_name)
@@ -42,18 +49,14 @@ class LLaVADataProcessor:
         video_inputs = {}
 
         if images is not None:
-            image_inputs = self.processor.image_processor(
-                images, return_tensors="pt", **output_kwargs["images_kwargs"]
-            )
+            image_inputs = self.processor.image_processor(images, return_tensors="pt", **output_kwargs["images_kwargs"])
 
             image_sizes = iter(image_inputs["image_sizes"])
             height = image_inputs["pixel_values"].shape[-2]
             width = image_inputs["pixel_values"].shape[-1]
             image_sizes = image_inputs["image_sizes"]
             num_image_tokens = [
-                self.processor._get_number_of_features(
-                    image_size[0], image_size[1], height, width
-                )
+                self.processor._get_number_of_features(image_size[0].item(), image_size[1].item(), height, width)
                 for image_size in image_sizes
             ]
         else:
@@ -67,24 +70,17 @@ class LLaVADataProcessor:
         return inputs
 
     def get_qwen_template_labels(self, hf_messages, num_image_tokens: List[int]):
-        image_token_index = self.processor.tokenizer.convert_tokens_to_ids(
-            self.processor.image_token
-        )
-        special_tokens = self.processor.tokenizer.additional_special_tokens
-        unmask_tokens_idx = [
-            self.processor.tokenizer.convert_tokens_to_ids(t) for t in special_tokens
-        ]
+        image_token_index = self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
+        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
         input_id, target = [], []
         start_from = 0
         for message in hf_messages:
             role = message["role"]
-            encode_id = self.processor.apply_chat_template([message], tokenize=True)[0]
+            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
             # If num image tokens is not None, it means we have images in the batch
             # otherwise something like <image> tag in html is used
             if image_token_index in encode_id and num_image_tokens is not None:
-                encode_id, used_images = self._expand_encode_id_image_tokens(
-                    encode_id, num_image_tokens, start_from
-                )
+                encode_id, used_images = self._expand_encode_id_image_tokens(encode_id, num_image_tokens, start_from)
                 start_from += used_images
             input_id += encode_id
             if role in ["user", "system"]:
@@ -124,9 +120,7 @@ class LLaVADataProcessor:
             # Before image pos, no expand
             expanded_encode_id.extend(encode_id[prev:pos])
             # Image pos, expand
-            expanded_encode_id.extend(
-                [self.image_token_id] * image_token_num[idx + start_from]
-            )
+            expanded_encode_id.extend([self.image_token_id] * image_token_num[idx + start_from])
             prev = pos + 1
 
             if idx == len(image_pos) - 1:
@@ -137,9 +131,7 @@ class LLaVADataProcessor:
 
     @property
     def image_token_id(self):
-        return self.processor.tokenizer.convert_tokens_to_ids(
-            self.processor.image_token
-        )
+        return self.processor.tokenizer.convert_tokens_to_ids(self.processor.image_token)
 
     @property
     def tokenizer(self):

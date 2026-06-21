@@ -14,9 +14,7 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
 AUDIO_TOKENS_PER_SECOND = 25  # 750 / 30
-VIDEO_TOKENS_PER_FRAMES = (360 * 420) / (
-    14 * 14 * 4
-)  # 360x420 image, 14x14 per patch, 4 patches per token
+VIDEO_TOKENS_PER_FRAMES = (360 * 420) / (14 * 14 * 4)  # 360x420 image, 14x14 per patch, 4 patches per token
 LARGE_ENOUGH_NUMBER = 1000
 PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 
@@ -71,19 +69,13 @@ def check_data_exists(data_dict):
     for message in messages:
         for content in message["content"]:
             if content["type"] == "image_url":
-                tokens = calculate_image_tokens(
-                    os.path.join(data_folder, content["image_url"]["url"])
-                )
+                tokens = calculate_image_tokens(os.path.join(data_folder, content["image_url"]["url"]))
                 content["precomputed_tokens"] = tokens
             elif content["type"] == "audio_url":
-                tokens = count_audio_tokens(
-                    os.path.join(data_folder, content["audio_url"]["url"])
-                )
+                tokens = count_audio_tokens(os.path.join(data_folder, content["audio_url"]["url"]))
                 content["precomputed_tokens"] = tokens
             elif content["type"] == "video_url":
-                tokens = calculate_video_tokens(
-                    os.path.join(data_folder, content["video_url"]["url"])
-                )
+                tokens = calculate_video_tokens(os.path.join(data_folder, content["video_url"]["url"]))
                 content["precomputed_tokens"] = tokens
 
     if "id" not in data:
@@ -103,10 +95,7 @@ def check_single_dataset(info):
                 data.append(d)
 
     data_folder = [data_folder] * len(data)
-    data_dict = [
-        {"data_folder": data_folder, "data": d}
-        for data_folder, d in zip(data_folder, data)
-    ]
+    data_dict = [{"data_folder": data_folder, "data": d} for data_folder, d in zip(data_folder, data)]
 
     with ThreadPool(32) as p:
         results = list(
@@ -134,9 +123,7 @@ if __name__ == "__main__":
 
     info = [
         (data_path, data_folder, data_type)
-        for data_path, data_folder, data_type in zip(
-            data_paths, data_folders, data_types
-        )
+        for data_path, data_folder, data_type in zip(data_paths, data_folders, data_types)
     ]
     with Pool(32) as p:
         results = list(tqdm(p.imap(check_single_dataset, info), total=len(info)))

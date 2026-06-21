@@ -16,7 +16,12 @@ class DatasetConfig(Args):
     dataset_path: Optional[str] = None  # Optional - used for external files
     datasets: Optional[List[dict]] = None  # Optional - used for inline YAML definitions
     shuffle: bool = True
+    data_seed: Optional[int] = 42
     eval_dataset_path: Optional[str] = None
+    # Dataset type used for the eval set. Defaults to a map-style variant so a small
+    # held-out set is sharded evenly by DistributedSampler (the iterable type shards
+    # rank-mod -> uneven per-rank counts -> all_reduce/barrier deadlock during eval).
+    eval_dataset_type: Optional[str] = None
 
     # Object storage configuration
     object_storage: Optional[Literal["azure", "gcs", "none"]] = "none"
@@ -34,9 +39,10 @@ class DatasetConfig(Args):
     video_sampling_strategy: Optional[Literal["fps", "frame_num"]] = "fps"
     video_max_pixels: Optional[int] = 768 * 28 * 28
     video_max_frames: Optional[int] = 768
+    video_min_pixels: Optional[int] = 3136
     frame_num: Optional[int] = 64
     fps: Optional[int] = 1
-    video_backend: Optional[Literal["decord", "qwen_vl_utils"]] = "qwen_vl_utils"
+    video_backend: Optional[Literal["decord", "qwen_vl_utils", "qwen_omni_utils"]] = "qwen_vl_utils"
 
     @field_validator(
         "video_max_pixels",
@@ -62,7 +68,7 @@ class DatasetConfig(Args):
         if v == "torchvision":
             raise ValueError(
                 "The 'torchvision' video backend has been removed. "
-                "Please use 'decord' or 'qwen_vl_utils' instead. "
+                "Please use 'decord', 'qwen_vl_utils', or 'qwen_omni_utils' instead. "
                 "Migration guide: If you were using torchvision, 'decord' provides "
                 "similar functionality with better performance."
             )

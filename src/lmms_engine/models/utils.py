@@ -26,12 +26,21 @@ VALID_CONFIG_TYPE = {
     "qwen2",
     "qwen2_vl",
     "qwen2_5_vl",
+    "qwen2_5_omni",
+    "qwen2_5_omni_thinker",
     "qwen3",
+    "qwen3_dllm",
     "qwen3_moe",
+    "qwen3_omni_moe",
+    "qwen3_omni_moe_thinker",
+    "qwen3_5",
+    "qwen3_vl",
+    "qwen3_vl_moe",
     "deepseek_v3",
     "minicpmv",
     "minicpmo",
     "llava_onevision",
+    "llava_onevision2",
 }
 
 
@@ -48,8 +57,7 @@ class FlopsCounter:
     def __init__(self, config: PretrainedConfig):
         if config.model_type not in VALID_CONFIG_TYPE:
             logger.warning(
-                f"Only support config type of {VALID_CONFIG_TYPE}, but got {config.model_type}. MFU will always be "
-                f"zero."
+                f"Only support config type of {VALID_CONFIG_TYPE}, but got {config.model_type}. MFU will not be counted."
             )
 
         self.estimate_func = {
@@ -58,36 +66,57 @@ class FlopsCounter:
             "qwen2_moe": self._estimate_qwen2_moe_flops,
             "qwen2_vl": self._estimate_qwen2_flops,
             "qwen2_5_vl": self._estimate_qwen2_flops,
+            "qwen2_5_omni": self._estimate_qwen2_flops,
+            "qwen2_5_omni_thinker": self._estimate_qwen2_flops,
             "qwen3": self._estimate_qwen2_flops,
+            "qwen3_dllm": self._estimate_qwen2_flops,
             "qwen3_moe": self._estimate_qwen2_moe_flops,
+            "qwen3_omni_moe": self._estimate_qwen2_moe_flops,
+            "qwen3_omni_moe_thinker": self._estimate_qwen2_moe_flops,
+            "qwen3_vl": self._estimate_qwen2_flops,
+            "qwen3_vl_moe": self._estimate_qwen2_moe_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
             "minicpmv": self._estimate_qwen2_flops,
             "minicpmo": self._estimate_qwen2_flops,
             "llava_onevision": self._estimate_qwen2_flops,
+            "llava_onevision2": self._estimate_qwen2_flops,
             "bagel": self._estimate_qwen2_flops,
         }
-        if config.model_type == "llava_onevision":
+        if config.model_type in [
+            "llava_onevision",
+            "llava_onevision2",
+            "qwen2_5_vl",
+            "qwen3_5",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen2_5_omni",
+            "qwen2_5_omni_thinker",
+            "qwen3_omni_moe",
+            "qwen3_omni_moe_thinker",
+        ]:
             self.config = config.text_config
+            self.config.model_type = config.model_type
         elif config.model_type == "bagel":
             self.config = config.llm_config
         else:
             self.config = config
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time):
-        return 0
+        return 0, 0
 
     def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
-        hidden_size = self.config.hidden_size
-        vocab_size = self.config.vocab_size
-        num_hidden_layers = self.config.num_hidden_layers
-        num_key_value_heads = self.config.num_key_value_heads
-        num_attention_heads = self.config.num_attention_heads
-        intermediate_size = self.config.intermediate_size
+        config = self.config
+        hidden_size = config.hidden_size
+        vocab_size = config.vocab_size
+        num_hidden_layers = config.num_hidden_layers
+        num_key_value_heads = config.num_key_value_heads
+        num_attention_heads = config.num_attention_heads
+        intermediate_size = config.intermediate_size
 
         head_dim = getattr(
-            self.config,
+            config,
             "head_dim",
-            self.config.hidden_size // self.config.num_attention_heads,
+            config.hidden_size // config.num_attention_heads,
         )
         q_size = num_attention_heads * head_dim
         k_size = num_key_value_heads * head_dim
@@ -96,9 +125,7 @@ class FlopsCounter:
         # non-attn per layer parm
         # Qwen2/LLama use SwiGelu, gate, having up and down linear layer in mlp
         mlp_N = hidden_size * intermediate_size * 3
-        attn_linear_N = hidden_size * (
-            q_size + k_size + v_size + num_attention_heads * head_dim
-        )
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
@@ -109,14 +136,12 @@ class FlopsCounter:
         seqlen_square_sum = 0
         for seqlen in batch_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = (
-            12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-        )
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        return flops_achieved
+        return flops_achieved, flops_all_token
 
     def _estimate_deepseek_v3_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
@@ -133,9 +158,7 @@ class FlopsCounter:
         # non-attn per layer parm
         moe_gata_N = hidden_size * moe_num_expert
         # moe has fc1_1, fc1_2 and fc2 using SwiGLU in ExpertMlp layer & shared experts
-        moe_expertmlp_N = (
-            hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
-        )
+        moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
         # MLA attn
         attn_linear_N = 0
         q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
@@ -145,9 +168,7 @@ class FlopsCounter:
             attn_linear_N += hidden_size * self.config.q_lora_rank
             attn_linear_N += num_query_heads * q_head_dim * self.config.q_lora_rank
 
-        attn_linear_N += hidden_size * (
-            self.config.kv_lora_rank + self.config.qk_rope_head_dim
-        )
+        attn_linear_N += hidden_size * (self.config.kv_lora_rank + self.config.qk_rope_head_dim)
         attn_linear_N += (
             num_query_heads
             * (q_head_dim - self.config.qk_rope_head_dim + self.config.v_head_dim)
@@ -157,10 +178,8 @@ class FlopsCounter:
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
         moe_N = (
-            (moe_gata_N + moe_expertmlp_N + attn_linear_N)
-            * (num_hidden_layers - first_k_dense_replace)
-            + (hidden_size * self.config.intermediate_size * 3 + attn_linear_N)
-            * first_k_dense_replace
+            (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers - first_k_dense_replace)
+            + (hidden_size * self.config.intermediate_size * 3 + attn_linear_N) * first_k_dense_replace
             + emd_and_lm_head_N
         )
         # non-attn all_layer & all_token fwd & bwd flops
@@ -176,7 +195,7 @@ class FlopsCounter:
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
 
-        return flops_achieved
+        return flops_achieved, flops_all_token
 
     def _estimate_qwen2_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
@@ -199,13 +218,8 @@ class FlopsCounter:
 
         # non-attn per layer parm
         # gate + moe export
-        moe_mlp_N = (
-            hidden_size * moe_topk * moe_intermediate_size * 3
-            + hidden_size * num_experts
-        )
-        attn_linear_N = hidden_size * (
-            q_size + k_size + v_size + num_attention_heads * head_dim
-        )
+        moe_mlp_N = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
         emd_and_lm_head_N = vocab_size * hidden_size * 2
         # non-attn all_layer parm
         dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
@@ -216,14 +230,12 @@ class FlopsCounter:
         seqlen_square_sum = 0
         for seqlen in batch_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = (
-            12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-        )
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        return flops_achieved
+        return flops_achieved, flops_all_token
 
     def estimate_flops(self, batch_seqlens, delta_time):
         """
@@ -237,14 +249,22 @@ class FlopsCounter:
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
             promised_flops (float): The expected FLOPS of the current device.
+            raw_flops (float): The total raw FLOPS for all tokens in the batch (fwd + bwd).
         """
+        # Flatten batch_seqlens if it contains nested lists (common for vision models)
+        if isinstance(batch_seqlens, (list, tuple)):
+            flat_seqlens = []
+            for item in batch_seqlens:
+                if isinstance(item, (list, tuple)):
+                    flat_seqlens.extend(item)
+                else:
+                    flat_seqlens.append(item)
+            batch_seqlens = flat_seqlens
         tokens_sum = sum(batch_seqlens)
-        func = self.estimate_func.get(
-            self.config.model_type, self._estimate_unknown_flops
-        )
-        estimated_flops = func(tokens_sum, batch_seqlens, delta_time)
+        func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
+        estimated_flops, raw_flops = func(tokens_sum, batch_seqlens, delta_time)
         promised_flops = TrainUtilities.get_device_flops()
-        return estimated_flops, promised_flops
+        return estimated_flops, promised_flops, raw_flops
 
 
 def setup_flops_counter(config: PretrainedConfig) -> FlopsCounter:

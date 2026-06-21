@@ -1,11 +1,21 @@
 import logging
 import math
-from typing import Iterable, List, Union
+from typing import Iterable, List, Literal, Optional, Union
 
 import deepspeed
 import torch
+import torch.distributed as dist
 from loguru import logger
+from torch.distributed import ProcessGroup
 from transformers import AutoProcessor
+
+from lmms_engine.utils.import_utils import is_torch_npu_available
+
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+IS_NPU_AVAILABLE = is_torch_npu_available()
+
+if IS_NPU_AVAILABLE:
+    torch.npu.config.allow_internal_format = False
 
 
 class TrainUtilities:
@@ -85,13 +95,9 @@ class TrainUtilities:
                 if content["type"] == "image_url":
                     new_message["content"].append({"type": "image"})
                 elif content["type"] == "audio_url":
-                    new_message["content"].append(
-                        {"type": "audio", "audio_url": content["audio_url"]["url"]}
-                    )
+                    new_message["content"].append({"type": "audio", "audio_url": content["audio_url"]["url"]})
                 elif content["type"] == "video_url":
-                    new_message["content"].append(
-                        {"type": "video", "video_url": content["video_url"]["url"]}
-                    )
+                    new_message["content"].append({"type": "video", "video_url": content["video_url"]["url"]})
                 else:
                     new_content = {"type": "text", "text": content["text"]}
                     if "audio_text" in content:
@@ -102,9 +108,7 @@ class TrainUtilities:
         return hf_messages
 
     @staticmethod
-    def sanity_check_labels(
-        processor: AutoProcessor, input_ids: torch.Tensor, labels: torch.Tensor
-    ):
+    def sanity_check_labels(processor: AutoProcessor, input_ids: torch.Tensor, labels: torch.Tensor):
         print(" ======== Inputs ========")
         for o in processor.batch_decode(input_ids):
             print(o)
@@ -130,7 +134,9 @@ class TrainUtilities:
         device_name = torch.cuda.get_device_name()
         flops = float("inf")  # INF flops for unkown gpu type
 
-        if "MI300X" in device_name:
+        if "B200" in device_name:
+            flops = 2.25e15
+        elif "MI300X" in device_name:
             flops = 1336e12
         elif "H100" in device_name or "H800" in device_name or "H200" in device_name:
             flops = 989e12
@@ -150,16 +156,81 @@ class TrainUtilities:
         return flops_unit
 
     @staticmethod
+    def get_device_tdp() -> float:
+        """Return TDP (watts) for the current GPU. 0.0 if unknown."""
+        device_name = torch.cuda.get_device_name()
+        if "MI300X" in device_name:
+            return 750.0
+        elif "B200" in device_name:
+            return 1000.0
+        elif "B300" in device_name:
+            return 1200.0
+        elif "H100" in device_name or "H800" in device_name:
+            return 700.0
+        elif "H200" in device_name:
+            return 700.0
+        elif "A100" in device_name or "A800" in device_name:
+            return 400.0
+        elif "L40" in device_name:
+            return 300.0
+        elif "L20" in device_name:
+            return 275.0
+        elif "H20" in device_name:
+            return 500.0
+        elif "910B" in device_name:
+            return 400.0
+        elif "RTX 3070 Ti" in device_name:
+            return 290.0
+        return 0.0
+
+    @staticmethod
+    def format_flops(flops: Union[int, float]) -> str:
+        """Format a FLOPS count into a compact string with unit suffix.
+
+        Uses a 1,000-based scale: MFLOPS, GFLOPS, TFLOPS, PFLOPS, EFLOPS.
+
+        Examples:
+            1.23e6  -> "1.23 MFLOPS"
+            1.23e12 -> "1.23 TFLOPS"
+            1.23e18 -> "1.23 EFLOPS"
+
+        Args:
+            flops: Total FLOPS count (can be int or float)
+
+        Returns:
+            A compact string representation with an appropriate unit suffix.
+        """
+        if flops is None:
+            return "0 FLOPS"
+        try:
+            value = float(flops)
+        except (TypeError, ValueError):
+            return str(flops)
+
+        if not math.isfinite(value) or value == 0:
+            return "0 FLOPS"
+
+        sign = "-" if value < 0 else ""
+        value = abs(value)
+
+        units = [
+            (1e18, "EFLOPS"),
+            (1e15, "PFLOPS"),
+            (1e12, "TFLOPS"),
+            (1e9, "GFLOPS"),
+            (1e6, "MFLOPS"),
+        ]
+        for threshold, unit in units:
+            if value >= threshold:
+                scaled = value / threshold
+                return f"{sign}{scaled:.2f} {unit}"
+
+        return f"{sign}{value:.0f} FLOPS"
+
+    @staticmethod
     def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
-        to_return = {
-            k: t
-            for k, t in named_params
-            if any(key_match in k for key_match in keys_to_match)
-        }
-        to_return = {
-            k: TrainUtilities.maybe_zero_3(v, ignore_status=True).cpu()
-            for k, v in to_return.items()
-        }
+        to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+        to_return = {k: TrainUtilities.maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
         return to_return
 
     @staticmethod
@@ -170,9 +241,7 @@ class TrainUtilities:
         if hasattr(param, "ds_id"):
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 if not ignore_status:
-                    logger.warning(
-                        f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}"
-                    )
+                    logger.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
             with zero.GatheredParameters([param]):
                 param = param.data.detach().cpu().clone()
         else:
@@ -209,61 +278,20 @@ class TrainUtilities:
         # self attention
         ## qkv projection
         qkv_proj_flops_fwd = (
-            2
-            * num_layers
-            * batch_size
-            * seq_len
-            * (hidden_size)
-            * num_heads
-            * hidden_size_per_head
-            + 2
-            * num_layers
-            * batch_size
-            * seq_len
-            * (hidden_size)
-            * 2
-            * num_key_value_heads
-            * hidden_size_per_head
+            2 * num_layers * batch_size * seq_len * (hidden_size) * num_heads * hidden_size_per_head
+            + 2 * num_layers * batch_size * seq_len * (hidden_size) * 2 * num_key_value_heads * hidden_size_per_head
         )
         ## qk logits
-        qk_logits_flops_fwd = (
-            2
-            * num_layers
-            * batch_size
-            * num_heads
-            * seq_len
-            * (hidden_size_per_head)
-            * seq_len
-        )
+        qk_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * seq_len
         ## v logits
-        v_logits_flops_fwd = (
-            2
-            * num_layers
-            * batch_size
-            * num_heads
-            * seq_len
-            * (seq_len)
-            * hidden_size_per_head
-        )
+        v_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (seq_len) * hidden_size_per_head
         ## attn out
-        attn_out_flops_fwd = (
-            2
-            * num_layers
-            * batch_size
-            * num_heads
-            * seq_len
-            * (hidden_size_per_head)
-            * hidden_size
-        )
+        attn_out_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * hidden_size
         # FF
         ## 1st layer
-        ffn_1_flops_fwd = (
-            4 * num_layers * batch_size * seq_len * (hidden_size) * ffn_hidden_size
-        )
+        ffn_1_flops_fwd = 4 * num_layers * batch_size * seq_len * (hidden_size) * ffn_hidden_size
         ## 2nd layer
-        ffn_2_flops_fwd = (
-            2 * num_layers * batch_size * seq_len * (ffn_hidden_size) * hidden_size
-        )
+        ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * (ffn_hidden_size) * hidden_size
 
         flops_fwd = (
             qkv_proj_flops_fwd
@@ -314,9 +342,7 @@ class TrainUtilities:
 
         # the bwd pass requires double the flops in case of matmuls to calculate the gradients with respect to
         # both input and weight tensors
-        model_flops = 3 * (
-            decoder_flops_fwd + lm_head_flops_fwd
-        )  # 1 for fwd + 2 for bwd
+        model_flops = 3 * (decoder_flops_fwd + lm_head_flops_fwd)  # 1 for fwd + 2 for bwd
 
         return model_flops
 
@@ -355,8 +381,7 @@ class TrainUtilities:
 
                 if (
                     model_key in model_state_dict
-                    and state_dict[checkpoint_key].shape
-                    != model_state_dict[model_key].shape
+                    and state_dict[checkpoint_key].shape != model_state_dict[model_key].shape
                 ):
                     mismatched_keys.append(
                         (
@@ -383,9 +408,7 @@ class TrainUtilities:
                 # because zero3 puts placeholders in model params, this context
                 # manager gathers (unpartitions) the params of the current layer, then loads from
                 # the state dict and then re-partitions them again
-                with deepspeed.zero.GatheredParameters(
-                    list(module.parameters(recurse=False)), modifier_rank=0
-                ):
+                with deepspeed.zero.GatheredParameters(list(module.parameters(recurse=False)), modifier_rank=0):
                     if torch.distributed.get_rank() == 0:
                         module._load_from_state_dict(*args)
             else:
@@ -403,10 +426,10 @@ class TrainUtilities:
         if len(error_msgs) > 0:
             error_msg = "\n\t".join(error_msgs)
             if "size mismatch" in error_msg:
-                error_msg += "\n\tYou may consider adding `ignore_mismatched_sizes=True` in the model `from_pretrained` method."
-            raise RuntimeError(
-                f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t{error_msg}"
-            )
+                error_msg += (
+                    "\n\tYou may consider adding `ignore_mismatched_sizes=True` in the model `from_pretrained` method."
+                )
+            raise RuntimeError(f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t{error_msg}")
         if len(unexpected_keys) > 0:
             logging.warning(
                 f"Some weights of the model checkpoint at {pretrained_model_path} were not used when"
@@ -418,9 +441,7 @@ class TrainUtilities:
                 " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
             )
         else:
-            logging.info(
-                f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n"
-            )
+            logging.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
         if len(missing_keys) > 0:
             logging.warning(
                 f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
@@ -447,3 +468,45 @@ class TrainUtilities:
                 f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
                 " to use it for predictions and inference."
             )
+
+    @staticmethod
+    def get_device_type() -> str:
+        """Get device type based on current machine, currently only support CPU, CUDA, NPU."""
+        if IS_CUDA_AVAILABLE:
+            device = "cuda"
+        elif IS_NPU_AVAILABLE:
+            device = "npu"
+        else:
+            device = "cpu"
+
+        return device
+
+    @staticmethod
+    def all_reduce(
+        data: Union[int, float, List[Union[int, float]], "torch.Tensor"],
+        op: Literal["mean", "sum", "max", "min"] = "mean",
+        group: Optional["ProcessGroup"] = None,
+    ) -> Union[int, float, List[Union[int, float]]]:
+        """
+        Performs all reduce in the given process group.
+        """
+        if not dist.is_initialized():
+            raise RuntimeError("Distributed environment is not initialized.")
+
+        if not isinstance(data, torch.Tensor):
+            data = torch.tensor(data, dtype=torch.float, device=TrainUtilities.get_device_type())
+
+        reduce_ops = {
+            "mean": dist.ReduceOp.SUM,
+            "sum": dist.ReduceOp.SUM,
+            "max": dist.ReduceOp.MAX,
+            "min": dist.ReduceOp.MIN,
+        }
+        dist.all_reduce(data, op=reduce_ops[op], group=group)
+        if op == "mean":  # ReduceOp.AVG is not supported by the NPU backend
+            data /= dist.get_world_size(group=group)
+
+        if data.numel() == 1:
+            return data.item()
+        else:
+            return data.tolist()

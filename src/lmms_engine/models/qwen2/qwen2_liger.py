@@ -12,10 +12,14 @@ try:
 except:
     print("Liger Kernel is not installed, pip install liger-kernel to use this patch")
 import torch
+import torch.distributed as dist
 
 from lmms_engine.parallel.sequence_parallel.ulysses import (
     calculate_seq_len_per_rank,
+    gather_outputs_and_unpad,
+    get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
+    pad_to_max_across_ranks,
     slice_input_tensor,
 )
 
@@ -70,19 +74,11 @@ def qwen2_lce_forward(
     "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
     ```"""
 
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -107,11 +103,7 @@ def qwen2_lce_forward(
     # if we are using sequence parallel, we need to slice the hidden states and labels
     labels_unpad = labels.view(-1)[word_idx.long()]
     if get_ulysses_sequence_parallel_world_size() > 1:
-        seq_lens = (
-            calculate_seq_len_per_rank(seq_lens.tolist())
-            if seq_lens is not None
-            else None
-        )
+        seq_lens = calculate_seq_len_per_rank(seq_lens.tolist()) if seq_lens is not None else None
         labels_unpad = slice_input_tensor(labels_unpad, dim=0, padding=True)
     labels = labels_unpad
 
@@ -144,9 +136,24 @@ def qwen2_lce_forward(
         shift_labels = shift_labels.view(-1)
 
         reduction = "sum" if "num_items_in_batch" in loss_kwargs else "mean"
+        # If using sp, we follow the loss calculation in verl, get loss for each token, then gather and sum them up
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            reduction = "none"
         lce = LigerFusedLinearCrossEntropyLoss(reduction=reduction)
-
         loss = lce(self.lm_head.weight, shift_hidden_states, shift_labels)
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            # Pad to max size across ranks, then gather and unpad
+            loss, total_padding = pad_to_max_across_ranks(loss, dim=0)
+            loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=total_padding)
+            # Calculate the actual number of valid tokens (non-ignored labels) across all ranks
+            # shift_labels shape is (num_tokens,) after flatten, -100 means ignore
+            num_valid_tokens = (shift_labels != -100).sum().float()
+            # Gather num_valid_tokens across all SP ranks to get the total count
+            sp_group = get_ulysses_sequence_parallel_group()
+            if sp_group is not None:
+                dist.all_reduce(num_valid_tokens, op=dist.ReduceOp.SUM, group=sp_group)
+            loss = torch.sum(loss) / (num_valid_tokens + 1e-8)
+
         if reduction == "sum":
             loss /= loss_kwargs["num_items_in_batch"]
 
